@@ -23,7 +23,7 @@ use crate::vision::projector::SpatialProjector;
 
 use crate::engine::persistence::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
-    prewarm_checkpoint_pages_with,
+    prewarm_checkpoint_pages_with, strip_qwen35_vision_weight_prefix,
 };
 
 use super::config::Qwen3_5Config;
@@ -1612,18 +1612,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 // Split vision/text weights
                 let has_vision = raw_params
                     .keys()
-                    .any(|k| k.starts_with("vision_tower.") || k.starts_with("visual."));
+                    .any(|k| strip_qwen35_vision_weight_prefix(k).is_some());
 
                 let (text_raw_params, vision_params) = if has_vision {
                     let mut vision_params: HashMap<String, MxArray> = HashMap::new();
                     let mut text_params: HashMap<String, MxArray> = HashMap::new();
                     for (name, array) in raw_params {
-                        if name.starts_with("vision_tower.") || name.starts_with("visual.") {
-                            let vkey = name
-                                .strip_prefix("vision_tower.")
-                                .or_else(|| name.strip_prefix("visual."))
-                                .unwrap_or(&name)
-                                .to_string();
+                        if let Some(vkey) = strip_qwen35_vision_weight_prefix(&name) {
+                            let vkey = vkey.to_string();
                             vision_params.insert(vkey, array);
                         } else {
                             text_params.insert(name, array);
@@ -1794,6 +1790,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     info!("Qwen3.5 model loaded successfully");
                 }
 
+                // The resident weight footprint is now known and materialized;
+                // only now allocate/cap the physical paged KV pool.
+                if let Some(ref vparams) = vision_params {
+                    let arrays: Vec<&MxArray> = vparams.values().collect();
+                    crate::array::memory::materialize_weights(&arrays)?;
+                }
+                inner.initialize_paged_adapter()?;
+
                 // Deterministic weight-byte total for the cache-limit
                 // coordinator. Includes both text `params` and the
                 // separated `vision_params` (when present) so the
@@ -1819,9 +1823,17 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
             let model_id = inner.model_id;
             let config_out = inner.config.clone();
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
+            let spatial_merge_size = inner.spatial_merge_size.unwrap_or(2);
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
             let mtp_active = inner.has_mtp_weights();
+            let vision_active = super::model::qwen35_dense_vision_active(
+                inner.vision_encoder.is_some(),
+                inner.image_processor.is_some(),
+                paged_active,
+            );
+            let context_limits =
+                super::model::Qwen3_5ContextLimits::from_tuple(inner.paged_context_limits());
 
             Ok((
                 inner,
@@ -1829,10 +1841,13 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     config_out,
                     model_id,
                     image_processor,
+                    spatial_merge_size,
                     tokenizer_out,
                     cache_limit_guard,
                     paged_active,
                     mtp_active,
+                    vision_active,
+                    context_limits,
                 ),
             ))
         },
@@ -1842,11 +1857,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
     let (
         config,
         _model_id,
-        _image_processor,
+        image_processor,
+        spatial_merge_size,
         _tokenizer,
         cache_limit_guard,
         paged_active,
         mtp_active,
+        vision_active,
+        context_limits,
     ) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
@@ -1856,6 +1874,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         config,
         paged_active,
         mtp_active,
+        vision_active,
+        image_processor,
+        spatial_merge_size,
+        context_limits,
         _cache_limit_guard: cache_limit_guard,
     })
 }
@@ -1961,31 +1983,16 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         full_attention_interval: gi(&["full_attention_interval"], 4),
         partial_rotary_factor,
         rope_theta,
-        paged_cache_memory_mb: {
-            let explicit = raw
-                .get("paged_cache_memory_mb")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-            let n_mtp_local = gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0);
-            // Stage 1 (MTP-paged enablement): when MTP heads are
-            // present AND the user did not set a budget, default to
-            // 256 MB instead of the global default 2048 MB so that
-            // opt-in Stage 2 benches via `MLX_QWEN35_PAGED_OVERRIDE=1`
-            // do not pay a measurable memory-pressure tax on the dense
-            // MTP path. The 2048 MB upfront `LayerKVPool` allocation
-            // slows dense MTP decode by ~30% on M5 Max at 27B/nvfp4
-            // (and 512 MB still costs ~16%, while 256 MB is within
-            // ~5%). 256 MB covers ~4k tokens of K/V on qwen3.6-27b
-            // (16 attn layers × 4096 × 8 KV heads × 128 head_dim ×
-            // 2 bytes × 2 K+V ≈ 256 MB). Stage 2's paged-attn verify
-            // port can lift this when it needs more capacity.
-            //
-            // This default is harmless on non-paged paths — the field
-            // is only consulted when `use_block_paged_cache=Some(true)`,
-            // which Stage 1 does NOT auto-set; see the comment on
-            // `use_block_paged_cache` below.
-            explicit.or(if n_mtp_local > 0 { Some(256) } else { None })
-        },
+        // Preserve absence as `None`: model construction distinguishes an
+        // explicit user budget from the implicit full-context default. Dense
+        // MTP checkpoints used to turn absence into `Some(256)` here, which
+        // made the constructor treat a ~4K-token benchmark fallback as a user
+        // override and bypass full-context sizing. Small MTP benchmark pools
+        // remain available by setting `paged_cache_memory_mb` explicitly.
+        paged_cache_memory_mb: raw
+            .get("paged_cache_memory_mb")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
         paged_block_size: raw
             .get("paged_block_size")
             .and_then(|v| v.as_u64())
@@ -2085,19 +2092,21 @@ pub(crate) fn load_vision_weights(
 
     let get_opt = |key: &str| -> Option<&MxArray> { params.get(key) };
 
-    // Patch embedding: handle both 4D Conv2d [out, kH, kW, in] and
-    // 5D Conv3d [out, kD, kH, kW, in] formats. For Conv3d, the static frame is
-    // duplicated across the temporal axis, so the effective 2D kernel is the
-    // sum of the temporal slices (not a single slice).
-    if let Some(pe_weight) = get_opt("patch_embed.proj.weight") {
-        let pe_bias = get_opt("patch_embed.proj.bias");
-        let ndim = pe_weight.ndim()?;
-        if ndim == 5 {
-            let conv2d_weight = collapse_patch_embed_conv3d(pe_weight)?;
-            encoder.set_patch_embed(&conv2d_weight, pe_bias)?;
-        } else {
-            encoder.set_patch_embed(pe_weight, pe_bias)?;
-        }
+    // Patch embedding is the required load anchor: the encoder constructor
+    // starts with a zero-valued placeholder, so silently accepting a missing
+    // projection would install an image-blind tower. Check the already
+    // normalized key used by both dense and MoE loaders. Keep both supported
+    // checkpoint layouts: 4D Conv2d [out, kH, kW, in] and 5D Conv3d
+    // [out, kD, kH, kW, in]. For Conv3d, the static frame is duplicated across
+    // the temporal axis, so the effective 2D kernel is the sum of its slices.
+    let pe_weight = get("patch_embed.proj.weight")?;
+    let pe_bias = get_opt("patch_embed.proj.bias");
+    let ndim = pe_weight.ndim()?;
+    if ndim == 5 {
+        let conv2d_weight = collapse_patch_embed_conv3d(pe_weight)?;
+        encoder.set_patch_embed(&conv2d_weight, pe_bias)?;
+    } else {
+        encoder.set_patch_embed(pe_weight, pe_bias)?;
     }
 
     // Position embedding
@@ -2217,6 +2226,82 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn qwen36_27b_mtp_config_json() -> Value {
+        json!({
+            "model_type": "qwen3_5",
+            "text_config": {
+                "vocab_size": 248320,
+                "hidden_size": 5120,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 4,
+                "num_hidden_layers": 64,
+                "intermediate_size": 17408,
+                "head_dim": 256,
+                "max_position_embeddings": 262144,
+                "full_attention_interval": 4,
+                "mtp_num_hidden_layers": 1
+            }
+        })
+    }
+
+    #[test]
+    fn dense_mtp_missing_paged_budget_reaches_full_context_default() {
+        let raw = qwen36_27b_mtp_config_json();
+        let config = parse_config(&raw).expect("Qwen3.6-27B config must parse");
+        assert_eq!(config.n_mtp_layers, 1, "fixture must exercise dense MTP");
+        assert_eq!(
+            config.paged_cache_memory_mb, None,
+            "an absent budget must remain distinguishable from an explicit override"
+        );
+
+        let default_memory_mb =
+            crate::models::qwen3_5::config::qwen35_default_paged_cache_memory_mb(
+                config.max_position_embeddings as u32,
+                config.paged_block_size.unwrap_or(16),
+                config.head_dim as u32,
+                config.num_kv_heads as u32,
+                config.full_attention_layer_count() as u32,
+            );
+        let (memory_mb, source) =
+            crate::models::qwen3_5::config::qwen35_resolve_paged_cache_memory_mb(
+                config.paged_cache_memory_mb,
+                default_memory_mb,
+            );
+        assert_eq!(memory_mb, 16_384);
+        assert_eq!(source, "auto_full_context");
+
+        let paged = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: memory_mb,
+            head_size: 256,
+            num_kv_heads: 4,
+            num_layers: 16,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(262_144),
+            max_batch_size: Some(32),
+        };
+        assert_eq!(paged.calculate_num_blocks(), 16_384);
+        assert_eq!(paged.max_cached_tokens(), 262_144);
+    }
+
+    #[test]
+    fn dense_mtp_explicit_paged_budget_stays_explicit() {
+        let mut raw = qwen36_27b_mtp_config_json();
+        raw["paged_cache_memory_mb"] = json!(2_048);
+
+        let config = parse_config(&raw).expect("Qwen3.6-27B config must parse");
+        assert_eq!(config.n_mtp_layers, 1);
+        assert_eq!(config.paged_cache_memory_mb, Some(2_048));
+
+        let (memory_mb, source) =
+            crate::models::qwen3_5::config::qwen35_resolve_paged_cache_memory_mb(
+                config.paged_cache_memory_mb,
+                16_384,
+            );
+        assert_eq!(memory_mb, 2_048);
+        assert_eq!(source, "config");
+    }
+
     #[test]
     fn collapse_patch_embed_conv3d_sums_temporal_slices() {
         // Synthetic Conv3d weight [out=2, kD=2, kH=2, kW=2, in=3] with distinct
@@ -2258,6 +2343,49 @@ mod tests {
                 (g - e).abs() < 1e-5,
                 "element {i}: collapsed {g} != slice0+slice1 {e}"
             );
+        }
+    }
+
+    #[test]
+    fn vision_patch_embed_anchor_is_required_and_accepts_4d_or_5d() {
+        let config = Qwen3_5VisionConfig {
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_heads: 1,
+            num_layers: 0,
+            patch_size: 1,
+            spatial_merge_size: 1,
+            image_size: 1,
+            out_hidden_size: 4,
+        };
+        let mut missing_encoder =
+            Qwen3_5VisionEncoder::new(config.clone()).expect("construct tiny vision encoder");
+        let err = load_vision_weights(&mut missing_encoder, &HashMap::new(), &config)
+            .expect_err("a partial vision tower must not retain the zero patch projection");
+        assert_eq!(
+            err.reason, "Missing vision weight: patch_embed.proj.weight",
+            "the required anchor uses the normalized vision key"
+        );
+
+        let array = |shape: &[i64]| {
+            let len = shape.iter().map(|dim| *dim as usize).product();
+            MxArray::from_float32(&vec![0.0; len], shape).expect("construct tiny vision weight")
+        };
+        let patch_shapes: [&[i64]; 2] = [&[4, 1, 1, 3], &[4, 2, 1, 1, 3]];
+        for patch_shape in patch_shapes {
+            let mut params = HashMap::new();
+            params.insert("patch_embed.proj.weight".to_string(), array(patch_shape));
+            params.insert("merger.norm.weight".to_string(), array(&[4]));
+            params.insert("merger.norm.bias".to_string(), array(&[4]));
+            params.insert("merger.linear_fc1.weight".to_string(), array(&[4, 4]));
+            params.insert("merger.linear_fc1.bias".to_string(), array(&[4]));
+            params.insert("merger.linear_fc2.weight".to_string(), array(&[4, 4]));
+            params.insert("merger.linear_fc2.bias".to_string(), array(&[4]));
+
+            let mut encoder =
+                Qwen3_5VisionEncoder::new(config.clone()).expect("construct tiny vision encoder");
+            load_vision_weights(&mut encoder, &params, &config)
+                .unwrap_or_else(|err| panic!("{patch_shape:?} patch anchor must load: {err}"));
         }
     }
 

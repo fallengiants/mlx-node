@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
@@ -31,6 +31,8 @@ Required Arguments:
 Optional Arguments:
   --dtype, -d <type>    Target dtype (default: bfloat16)
                         Options: float32, float16, bfloat16
+  --config-dir <path>   Hugging Face config/tokenizer asset directory to copy
+                        when converting a GGUF model
   --model-type, -m      Model type (auto-detected if not specified)
                         Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_5, qwen3_5_moe, lfm2_moe, lfm2, qianfan-ocr, privacy-filter
   --verbose, -v         Enable verbose logging
@@ -168,6 +170,7 @@ export async function run(argv: string[]) {
       'q-recipe': { type: 'string' },
       'q-mtp': { type: 'string' },
       'imatrix-path': { type: 'string' },
+      'config-dir': { type: 'string' },
       mmproj: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -336,6 +339,23 @@ export async function run(argv: string[]) {
     `official Unsloth ${lowFormat === 'nvfp4' ? 'DGX/NVFP4' : 'MXFP'} map (early FFN=${lowFormat}; final 8 FFN + attention/GDN/head=mxfp8; protected classes=bf16)`;
   const requestedOfficialUnslothSummary = (lowFormat: 'mxfp4' | 'nvfp4') =>
     `requested ${officialUnslothSummary(lowFormat)}; backend verifies Qwen family/shape`;
+  // Render the `Quantize:` line body shared by the GGUF and SafeTensors paths.
+  // `qGsLabel` carries the group-size text (the GGUF path never reaches sym8,
+  // so it always passes `group_size=N`); `mtp` is `'off'` on the GGUF path,
+  // which has no MTP transcode, so its suffix stays empty there.
+  const formatQuantizeSummary = (qBits: number, qMode: string, qGsLabel: string, mtp: string): string => {
+    const mtpSuffix = mtp !== 'off' ? `, mtp=${mtp}` : '';
+    if (usesOfficialUnslothMxfp) {
+      return `${requestedOfficialUnslothSummary('mxfp4')}, recipe=unsloth${mtpSuffix}`;
+    }
+    if (usesOfficialUnslothNvfp4) {
+      return `${requestedOfficialUnslothSummary('nvfp4')}, recipe=unsloth${mtpSuffix}`;
+    }
+    const qMxfpSuffix = args['q-mxfp']
+      ? ', --q-mxfp: eligible 8b->mxfp8/4b->mxfp4 (protected affine keys stay affine)'
+      : '';
+    return `${qBits}-bit ${qMode} (${qGsLabel})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}${mtpSuffix}`;
+  };
 
   // MXFP modes have strict bits/group_size invariants enforced by the MLX
   // backend. Surface the failure here rather than letting it bubble up as a
@@ -392,6 +412,18 @@ export async function run(argv: string[]) {
     }
   }
 
+  const configSourceDir = args['config-dir'] ? resolve(args['config-dir']) : undefined;
+  if (configSourceDir !== undefined) {
+    if (!existsSync(configSourceDir)) {
+      console.error(`Error: config directory not found: ${configSourceDir}`);
+      process.exit(1);
+    }
+    if (!statSync(configSourceDir).isDirectory()) {
+      console.error(`Error: --config-dir must point to a directory: ${configSourceDir}`);
+      process.exit(1);
+    }
+  }
+
   const startTime = Date.now();
 
   // GGUF file detection
@@ -424,24 +456,16 @@ export async function run(argv: string[]) {
       const [defaultBits, defaultGs] = QUANT_MODE_DEFAULTS[qMode] ?? [4, 64];
       const qBits = effectiveQuantBits || defaultBits;
       const qGs = quantGroupSize || defaultGs;
-      if (usesOfficialUnslothMxfp) {
-        console.log(`Quantize:   ${requestedOfficialUnslothSummary('mxfp4')}, recipe=unsloth`);
-      } else if (usesOfficialUnslothNvfp4) {
-        console.log(`Quantize:   ${requestedOfficialUnslothSummary('nvfp4')}, recipe=unsloth`);
-      } else {
-        const qMxfpSuffix = args['q-mxfp']
-          ? ', --q-mxfp: eligible 8b->mxfp8/4b->mxfp4 (protected affine keys stay affine)'
-          : '';
-        console.log(
-          `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}`,
-        );
-      }
+      console.log(`Quantize:   ${formatQuantizeSummary(qBits, qMode, `group_size=${qGs}`, 'off')}`);
     }
     if (imatrixPath) {
       console.log(`imatrix:    ${imatrixPath}`);
     }
     if (mmprojPath) {
       console.log(`mmproj:     ${mmprojPath}`);
+    }
+    if (configSourceDir) {
+      console.log(`Config dir: ${configSourceDir}`);
     }
     console.log('');
 
@@ -458,6 +482,7 @@ export async function run(argv: string[]) {
         quantMxfp: args['q-mxfp'],
         quantRecipe,
         imatrixPath,
+        configSourceDir,
         vlmKeyPrefix: !!mmprojPath,
       });
 
@@ -483,6 +508,7 @@ export async function run(argv: string[]) {
           dtype: 'bfloat16',
           verbose,
           quantize: false,
+          configSourceDir,
           outputFilename: 'vision.safetensors',
         });
         console.log(`✓ Converted ${visionResult.numTensors} vision tensors`);
@@ -595,22 +621,7 @@ export async function run(argv: string[]) {
     const qBits = effectiveQuantBits || defaultBits;
     const qGs = quantGroupSize || defaultGs;
     const qGsLabel = qMode === 'sym8' ? 'per-output-channel' : `group_size=${qGs}`;
-    if (usesOfficialUnslothMxfp) {
-      console.log(
-        `Quantize:   ${requestedOfficialUnslothSummary('mxfp4')}, recipe=unsloth${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,
-      );
-    } else if (usesOfficialUnslothNvfp4) {
-      console.log(
-        `Quantize:   ${requestedOfficialUnslothSummary('nvfp4')}, recipe=unsloth${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,
-      );
-    } else {
-      const qMxfpSuffix = args['q-mxfp']
-        ? ', --q-mxfp: eligible 8b->mxfp8/4b->mxfp4 (protected affine keys stay affine)'
-        : '';
-      console.log(
-        `Quantize:   ${qBits}-bit ${qMode} (${qGsLabel})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,
-      );
-    }
+    console.log(`Quantize:   ${formatQuantizeSummary(qBits, qMode, qGsLabel, quantMtp)}`);
   }
   if (imatrixPath) {
     console.log(`imatrix:    ${imatrixPath}`);

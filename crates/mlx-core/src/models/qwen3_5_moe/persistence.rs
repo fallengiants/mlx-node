@@ -11,7 +11,7 @@ use tracing::{info, warn};
 use crate::array::{DType, MxArray};
 use crate::engine::persistence::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
-    prewarm_checkpoint_pages,
+    prewarm_checkpoint_pages, strip_qwen35_vision_weight_prefix,
 };
 use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIXES};
 use crate::models::quant_dispatch::{
@@ -1497,18 +1497,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     // Split vision/text weights
                     let has_vision = raw_params
                         .keys()
-                        .any(|k| k.starts_with("vision_tower.") || k.starts_with("visual."));
+                        .any(|k| strip_qwen35_vision_weight_prefix(k).is_some());
 
                     let (text_raw_params, vision_params) = if has_vision {
                         let mut vision_params: HashMap<String, MxArray> = HashMap::new();
                         let mut text_params: HashMap<String, MxArray> = HashMap::new();
                         for (name, array) in raw_params {
-                            if name.starts_with("vision_tower.") || name.starts_with("visual.") {
-                                let vkey = name
-                                    .strip_prefix("vision_tower.")
-                                    .or_else(|| name.strip_prefix("visual."))
-                                    .unwrap_or(&name)
-                                    .to_string();
+                            if let Some(vkey) = strip_qwen35_vision_weight_prefix(&name) {
+                                let vkey = vkey.to_string();
                                 vision_params.insert(vkey, array);
                             } else {
                                 text_params.insert(name, array);
@@ -1646,6 +1642,15 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         &per_layer_quant,
                     )?;
 
+                    // Delay physical paged-pool allocation until all text and
+                    // vision weights are resident so the live-memory cap sees
+                    // the actual model footprint.
+                    if let Some(ref vparams) = vision_params {
+                        let arrays: Vec<&MxArray> = vparams.values().collect();
+                        crate::array::memory::materialize_weights(&arrays)?;
+                    }
+                    inner.initialize_paged_adapter()?;
+
                     // Deterministic weight-byte total for the cache-limit
                     // coordinator. Includes text + vision weights when a
                     // vision encoder is loaded. `saturating_add` guards
@@ -1669,9 +1674,18 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
             let model_id = inner.model_id;
             let config_out = inner.config.clone();
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
+            let spatial_merge_size = inner.spatial_merge_size.unwrap_or(2);
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
             let mtp_active = inner.has_mtp_weights();
+            let vision_active = super::model::qwen35_moe_vision_active(
+                inner.vision_encoder.is_some(),
+                inner.image_processor.is_some(),
+                paged_active,
+            );
+            let context_limits = crate::models::qwen3_5::model::Qwen3_5ContextLimits::from_tuple(
+                inner.paged_context_limits(),
+            );
 
             Ok((
                 inner,
@@ -1679,10 +1693,13 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     config_out,
                     model_id,
                     image_processor,
+                    spatial_merge_size,
                     tokenizer_out,
                     cache_limit_guard,
                     paged_active,
                     mtp_active,
+                    vision_active,
+                    context_limits,
                 ),
             ))
         },
@@ -1692,11 +1709,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
     let (
         config,
         _model_id,
-        _image_processor,
+        image_processor,
+        spatial_merge_size,
         _tokenizer,
         cache_limit_guard,
         paged_active,
         mtp_active,
+        vision_active,
+        context_limits,
     ) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
@@ -1706,6 +1726,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         config,
         paged_active,
         mtp_active,
+        vision_active,
+        image_processor,
+        spatial_merge_size,
+        context_limits,
         _cache_limit_guard: cache_limit_guard,
     })
 }
@@ -2812,7 +2836,10 @@ mod tests {
             "affine checkpoints must keep their block-paged request"
         );
         if crate::engine::persistence::compiled_forward_backend_available() {
-            let inner = Qwen35MoeInner::new(cfg).expect("Qwen35MoeInner::new must succeed");
+            let mut inner = Qwen35MoeInner::new(cfg).expect("Qwen35MoeInner::new must succeed");
+            inner
+                .initialize_paged_adapter()
+                .expect("post-load paged adapter initialization must succeed");
             assert!(
                 inner.paged_adapter.is_some(),
                 "affine paged config must build the paged adapter"

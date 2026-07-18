@@ -45,10 +45,10 @@ import type {
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
-import type { ChatSession } from '@mlx-node/lm';
+import type { ChatSession, PerformanceMetrics } from '@mlx-node/lm';
 
 import type { DiscoveredModelLike } from '../types.js';
-import { buildChatConfig } from './chat-config.js';
+import { buildChatConfig, resolveReasoningMode, type ResolvedReasoningMode } from './chat-config.js';
 import { contextToChatMessages, toolsToDefinitions } from './convert-messages.js';
 import { coerceErrorMessage } from './error-coercion.js';
 import { emptyUsage, TurnEmitter } from './events.js';
@@ -72,6 +72,9 @@ export interface StreamSimpleHost {
   invalidateResident(modelId: string): void;
 }
 
+export type PerformanceRecorder = (message: AssistantMessage, performance: PerformanceMetrics) => void;
+export type RootCacheOwnerResolver = () => string | undefined;
+
 /** Property read that must not throw (poisoned getters on a hostile `Model`). */
 function safeString(read: () => string, fallback: string): string {
   try {
@@ -80,6 +83,59 @@ function safeString(read: () => string, fallback: string): string {
   } catch {
     return fallback;
   }
+}
+
+/**
+ * Publish the native model's load-time physical context limit onto pi's shared
+ * model object. The parent session and every in-process subagent resolve this
+ * same object from one `ModelRegistry`, so the first completed model load gives
+ * all later turns the correct auto-compaction window without another channel.
+ *
+ * This is advisory only: the ChatSession preflight remains the correctness
+ * backstop for the first turn and for hostile/invalid getters. Never expand a
+ * discovery-time limit here, and never let metadata synchronization break an
+ * otherwise valid inference turn.
+ */
+function publishEffectiveContextWindow(model: Model<Api>, session: ChatSession): void {
+  try {
+    const effective = Math.floor(session.contextLimits()?.effectiveWindowTokens ?? 0);
+    if (!Number.isSafeInteger(effective) || effective <= 0) return;
+    model.contextWindow = Math.min(model.contextWindow, effective);
+    model.maxTokens = Math.min(model.maxTokens, model.contextWindow);
+  } catch {
+    // Exact native preflight still protects capacity; keep serving the turn.
+  }
+}
+
+/**
+ * Publish the loaded model's authoritative image capability onto Pi's shared
+ * model object. Discovery stays conservatively text-only; the first resident
+ * load upgrades the same object before Pi executes any tool call emitted by
+ * that inference turn. Return the native truth separately so a hostile/frozen
+ * Pi model object cannot prevent image bytes from reaching the provider.
+ */
+function publishImageCapability(model: Model<Api>, session: ChatSession): boolean {
+  let supportsImages = false;
+  try {
+    supportsImages = session.supportsImages();
+  } catch {
+    return false;
+  }
+
+  try {
+    const advertisesImages = model.input.includes('image');
+    if (supportsImages && !advertisesImages) {
+      model.input = [...model.input, 'image'];
+    } else if (!supportsImages && advertisesImages) {
+      // Pi reuses model objects across resident swaps. Reconcile a stale
+      // positive capability without disturbing any other inputs or their
+      // order, so its tools do not return image blocks to a text-only model.
+      model.input = model.input.filter((input) => input !== 'image');
+    }
+  } catch {
+    // Native capability remains authoritative for this turn's conversion.
+  }
+  return supportsImages;
 }
 
 /**
@@ -104,6 +160,8 @@ function failsafeMessage(model: Model<Api>, reason: 'aborted' | 'error', message
 
 export function makeMlxStreamSimple(
   host: StreamSimpleHost,
+  onPerformance?: PerformanceRecorder,
+  resolveRootCacheOwner?: RootCacheOwnerResolver,
 ): (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
@@ -117,6 +175,8 @@ export function makeMlxStreamSimple(
     let terminated = false;
     let emitter: TurnEmitter | undefined;
     let signal: AbortSignal | undefined;
+    let rootCacheOwnerId: string | undefined;
+    let resolvedReasoning: ResolvedReasoningMode;
     let detachAbort: (() => void) | undefined;
 
     /**
@@ -183,7 +243,15 @@ export function makeMlxStreamSimple(
       // `options`/`Model` getter or a TurnEmitter constructor failure must
       // become a stream terminal, never a synchronous throw into pi.
       signal = options?.signal;
-      emitter = new TurnEmitter(stream, model);
+      // Snapshot the top-level owner before this request can queue behind
+      // another inference. A later /new or /resume must not relabel an older
+      // request that was already submitted under the previous root.
+      rootCacheOwnerId = resolveRootCacheOwner?.();
+      // Snapshot once: the native config and the replay provenance must describe
+      // the same resolved template mode. Presence alone is wrong for Pi's
+      // minimal/low levels, both of which resolve to disabled thinking.
+      resolvedReasoning = resolveReasoningMode(options?.reasoning);
+      emitter = new TurnEmitter(stream, model, onPerformance, resolvedReasoning.thinkingEnabled);
     } catch (err) {
       terminalize('error', err);
       return stream;
@@ -213,6 +281,8 @@ export function makeMlxStreamSimple(
         // between stages below): the terminal already went out — skip ALL
         // session work (no warm-reset, no prime, no stream).
         if (terminated) return;
+        publishEffectiveContextWindow(model, session);
+        const supportsImages = publishImageCapability(model, session);
         const discovered = host.modelInfo(model.id);
         if (!discovered) {
           throw new Error(`mlx streamSimple: no discovery record for model "${model.id}"`);
@@ -234,8 +304,14 @@ export function makeMlxStreamSimple(
         }
         if (terminated) return;
         try {
-          session.primeHistory(contextToChatMessages(context));
-          const config = buildChatConfig(discovered.modelType, options, toolsToDefinitions(context.tools));
+          session.primeHistory(contextToChatMessages(context, supportsImages));
+          const config = buildChatConfig(
+            discovered.modelType,
+            options,
+            toolsToDefinitions(context.tools),
+            rootCacheOwnerId,
+            resolvedReasoning,
+          );
           for await (const event of session.startFromHistoryStream(config, signal)) {
             if (event.done) {
               if (event.finishReason === 'error') {
