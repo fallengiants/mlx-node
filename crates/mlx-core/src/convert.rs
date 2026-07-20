@@ -1865,14 +1865,12 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         if quant_mode == "nvfp4" {
             validate_nvfp4_recipe(recipe).map_err(Error::from_reason)?;
         }
-        // Unsloth recipe requires imatrix for near-lossless attention/SSM quantization
-        if recipe == "unsloth" && imatrix_path.is_none() {
-            return Err(Error::from_reason(
-                "unsloth recipe requires --imatrix-path: imatrix calibration data is needed \
-                 for near-lossless quantization of attention/SSM layers"
-                    .to_string(),
-            ));
-        }
+        // Legacy Dynamic 2.0 relies on AWQ calibration. The fixed official
+        // Qwen maps may defer this check until family + sanitized tensor-shape
+        // selection below; that late gate prevents a caller which bypasses the
+        // CLI from silently falling back to the legacy predicate without AWQ.
+        validate_unsloth_imatrix_selector(recipe, imatrix_path.as_deref(), quant_mxfp, &quant_mode)
+            .map_err(Error::from_reason)?;
     }
 
     // Validate input directory
@@ -2479,6 +2477,33 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             }
         );
 
+        // Resolve and validate the fixed Unsloth map before dispatching to a
+        // model-specific quantization branch. Most recipes use the generic
+        // branch below, but privacy-filter owns a dedicated predicate and
+        // would otherwise bypass the late no-imatrix fail-closed gate.
+        let recipe_weight_keys = quant_recipe
+            .as_ref()
+            .map(|_| converted_tensors.keys().cloned().collect::<Vec<_>>());
+        let official_unsloth_kind = match (quant_recipe.as_deref(), recipe_weight_keys.as_deref()) {
+            (Some(recipe), Some(weight_keys)) => {
+                let kind = select_and_validate_official_unsloth_recipe(
+                    recipe,
+                    imatrix_path.as_deref(),
+                    quant_mxfp,
+                    &quant_mode,
+                    &config,
+                    model_type.as_deref(),
+                    weight_keys,
+                )
+                .map_err(Error::from_reason)?;
+                if recipe == "unsloth" && imatrix_path.is_none() {
+                    warn!("{}", UNSLOTH_NO_IMATRIX_WARNING);
+                }
+                kind
+            }
+            _ => None,
+        };
+
         if is_privacy_filter {
             // Privacy-filter has a dedicated predicate: quantize attention
             // projections (q/k/v/o) and MoE experts (gate_up_proj, down_proj);
@@ -2535,7 +2560,9 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 );
             }
         } else if let Some(ref recipe) = quant_recipe {
-            let weight_keys: Vec<String> = converted_tensors.keys().cloned().collect();
+            let weight_keys = recipe_weight_keys
+                .as_deref()
+                .expect("recipe keys are collected whenever quant_recipe is present");
             // Recipes emit affine `Custom` decisions for protected tensors
             // (lm_head, AWQ-corrected attn/SSM projections, etc). Affine
             // quantize only supports group_size ∈ {32, 64, 128}, so when the
@@ -2549,22 +2576,9 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             } else {
                 quant_group_size
             };
-            // Verified Qwen hybrids use Unsloth's official float class map:
-            // `--q-mxfp` translates FP8/NVFP4 to MXFP8/MXFP4, while
-            // `--q-mode nvfp4` preserves NVFP4 for the low FFN class and uses
-            // MXFP8 for the high class. This is not a mechanical rewrite of
-            // the legacy Dynamic 2.0 affine decisions.
-            // The official map is Qwen3.5/Qwen3.6-hybrid-specific. Gate on the
-            // input config (ground truth), the requested sanitizer family, and
-            // the sanitized weight shape. If any of those are unavailable or
-            // disagree, preserve the legacy family-agnostic upgrade wrappers.
-            let is_qwen35_hybrid =
-                is_qwen35_hybrid_checkpoint(&config, model_type.as_deref(), &weight_keys);
-            let official_unsloth_kind =
-                select_official_unsloth_recipe(recipe, quant_mxfp, &quant_mode, is_qwen35_hybrid);
             let predicate = match official_unsloth_kind {
-                Some(kind) => build_official_unsloth_recipe(&weight_keys, kind),
-                None => build_predicate_for_recipe(recipe, &weight_keys, quant_bits, recipe_gs)
+                Some(kind) => build_official_unsloth_recipe(weight_keys, kind),
+                None => build_predicate_for_recipe(recipe, weight_keys, quant_bits, recipe_gs)
                     .map_err(Error::from_reason)?,
             };
             let predicate: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
@@ -4055,6 +4069,57 @@ pub(crate) enum OfficialUnslothRecipeKind {
     Nvfp4,
 }
 
+/// User-facing warning for a verified fixed Unsloth map without calibration.
+/// The tensor-class assignment is deterministic and remains identical; only
+/// the optional AWQ weight reparameterization is absent.
+pub(crate) const UNSLOTH_NO_IMATRIX_WARNING: &str = "Unsloth fixed class map selected without --imatrix-path: AWQ pre-scaling is skipped; \
+     the MXFP4/MXFP8 or NVFP4/MXFP8 class map is unchanged, but quantization quality may be lower.";
+
+/// Early imatrix policy gate, before model loading or MLX initialization.
+///
+/// Plain affine Unsloth is the legacy Dynamic 2.0 recipe and still requires
+/// calibration. `--q-mxfp` and `--q-mode nvfp4` merely defer the decision:
+/// only a later, independently verified official Qwen class-map selection may
+/// actually proceed without an imatrix.
+pub(crate) fn validate_unsloth_imatrix_selector(
+    recipe: &str,
+    imatrix_path: Option<&str>,
+    quant_mxfp: bool,
+    quant_mode: &str,
+) -> std::result::Result<(), String> {
+    if recipe != "unsloth" || imatrix_path.is_some() || quant_mxfp || quant_mode == "nvfp4" {
+        return Ok(());
+    }
+    Err(
+        "legacy affine unsloth recipe requires --imatrix-path for AWQ pre-scaling; \
+         without calibration, only the fixed official maps selected by --q-mxfp or \
+         --q-mode nvfp4 are supported"
+            .to_string(),
+    )
+}
+
+/// Late fail-closed gate after family + sanitized tensor-shape selection.
+///
+/// A no-imatrix request is valid only if it selected one of the official fixed
+/// maps. This prevents the SafeTensors and GGUF backends from falling through
+/// to the family-agnostic legacy predicate when callers bypass CLI validation.
+pub(crate) fn validate_unsloth_imatrix_after_selection(
+    recipe: &str,
+    imatrix_path: Option<&str>,
+    official_kind: Option<OfficialUnslothRecipeKind>,
+) -> std::result::Result<(), String> {
+    if recipe != "unsloth" || imatrix_path.is_some() || official_kind.is_some() {
+        return Ok(());
+    }
+    Err(
+        "unsloth without --imatrix-path is supported only for a verified Qwen3.5/Qwen3.6 \
+         hybrid checkpoint using the fixed official --q-mxfp or --q-mode nvfp4 class map; \
+         family/shape validation did not select an official map, so refusing to fall back \
+         to legacy Dynamic 2.0 without AWQ calibration"
+            .to_string(),
+    )
+}
+
 /// Select an official class map only for a verified Qwen3.5/Qwen3.6 hybrid
 /// checkpoint. Plain affine and non-Qwen/ambiguous inputs continue through the
 /// legacy Dynamic 2.0 predicate and its existing upgrade wrappers.
@@ -4074,6 +4139,29 @@ pub(crate) fn select_official_unsloth_recipe(
     } else {
         None
     }
+}
+
+/// Select and validate the SafeTensors fixed Unsloth class map from the input
+/// config, requested sanitizer family, and sanitized tensor inventory.
+///
+/// This helper is deliberately called before model-specific quantization
+/// dispatch. A sanitizer-managed branch (currently privacy-filter) must not be
+/// able to bypass the late no-imatrix gate merely because it uses a dedicated
+/// predicate instead of [`build_predicate_for_recipe`].
+fn select_and_validate_official_unsloth_recipe(
+    recipe: &str,
+    imatrix_path: Option<&str>,
+    quant_mxfp: bool,
+    quant_mode: &str,
+    config: &serde_json::Value,
+    requested_model_type: Option<&str>,
+    weight_keys: &[String],
+) -> std::result::Result<Option<OfficialUnslothRecipeKind>, String> {
+    let is_qwen35_hybrid = is_qwen35_hybrid_checkpoint(config, requested_model_type, weight_keys);
+    let official_kind =
+        select_official_unsloth_recipe(recipe, quant_mxfp, quant_mode, is_qwen35_hybrid);
+    validate_unsloth_imatrix_after_selection(recipe, imatrix_path, official_kind)?;
+    Ok(official_kind)
 }
 
 /// Build the official Unsloth float class map for Qwen3.5 hybrid models.
@@ -4733,7 +4821,8 @@ pub(crate) const NVFP4_NO_RECIPE_ERROR: &str = "--q-mode nvfp4 requires --q-reci
      Pure NVFP4 corrupts sensitivity-critical tensors (linear_attn.out_proj, \
      self_attn.o_proj, mlp.down_proj, in_proj_qkv/z, q/k/v_proj) without a \
      recipe's per-tensor affine fallbacks. 'qwen3_5' works without an \
-     imatrix; 'unsloth' is the gold-standard but requires --imatrix-path.";
+     imatrix; 'unsloth' may omit it only when family/shape validation selects \
+     the fixed official Qwen class map.";
 
 /// Recipe predicates drive per-key `QuantDecision`s that bypass every
 /// sym8-scoped guard in the legacy (no-recipe) path: the `sym8_eligible`
@@ -8090,7 +8179,7 @@ mod tests {
         );
         assert!(
             NVFP4_NO_RECIPE_ERROR.contains("unsloth"),
-            "error must mention 'unsloth' as the imatrix-required recipe, got: {NVFP4_NO_RECIPE_ERROR}"
+            "error must mention 'unsloth' and its calibrated/fixed-map path, got: {NVFP4_NO_RECIPE_ERROR}"
         );
     }
 
@@ -11190,6 +11279,99 @@ mod tests {
         assert_eq!(
             select_official_unsloth_recipe("nvidia", true, "affine", true),
             None
+        );
+    }
+
+    #[test]
+    fn unsloth_no_imatrix_selector_keeps_plain_affine_fail_closed() {
+        let err = validate_unsloth_imatrix_selector("unsloth", None, false, "affine")
+            .expect_err("legacy affine Unsloth must still require AWQ calibration");
+        assert!(err.contains("legacy affine"), "unexpected error: {err}");
+        assert!(err.contains("--imatrix-path"), "unexpected error: {err}");
+
+        validate_unsloth_imatrix_selector("unsloth", Some("imatrix.gguf"), false, "affine")
+            .expect("legacy affine with an imatrix must remain accepted");
+    }
+
+    #[test]
+    fn unsloth_no_imatrix_fixed_selectors_defer_to_verified_map_gate() {
+        validate_unsloth_imatrix_selector("unsloth", None, true, "affine")
+            .expect("--q-mxfp may defer to official-map verification");
+        validate_unsloth_imatrix_selector("unsloth", None, false, "nvfp4")
+            .expect("--q-mode nvfp4 may defer to official-map verification");
+    }
+
+    #[test]
+    fn unsloth_no_imatrix_late_gate_requires_an_official_map() {
+        let err = validate_unsloth_imatrix_after_selection("unsloth", None, None)
+            .expect_err("an unverified no-imatrix request must not use the legacy fallback");
+        assert!(
+            err.contains("verified Qwen3.5/Qwen3.6"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("refusing to fall back"),
+            "unexpected error: {err}"
+        );
+
+        for kind in [
+            OfficialUnslothRecipeKind::Mxfp,
+            OfficialUnslothRecipeKind::Nvfp4,
+        ] {
+            validate_unsloth_imatrix_after_selection("unsloth", None, Some(kind))
+                .expect("a verified fixed official map may run without an imatrix");
+        }
+        validate_unsloth_imatrix_after_selection("unsloth", Some("imatrix.gguf"), None)
+            .expect("an imatrix keeps the existing fallback behavior available");
+    }
+
+    #[test]
+    fn unsloth_no_imatrix_privacy_filter_is_rejected_before_dedicated_quantization() {
+        let config = serde_json::json!({
+            "model_type": "privacy-filter",
+            "tie_word_embeddings": false,
+        });
+        let weight_keys = [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.mlp.experts.gate_up_proj.weight",
+            "model.layers.0.mlp.experts.down_proj.weight",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+        for (quant_mxfp, quant_mode) in [(true, "affine"), (false, "nvfp4")] {
+            let err = select_and_validate_official_unsloth_recipe(
+                "unsloth",
+                None,
+                quant_mxfp,
+                quant_mode,
+                &config,
+                Some("privacy-filter"),
+                &weight_keys,
+            )
+            .expect_err("privacy-filter must not bypass no-imatrix official-map validation");
+            assert!(
+                err.contains("verified Qwen3.5/Qwen3.6"),
+                "unexpected error for mode={quant_mode}, q_mxfp={quant_mxfp}: {err}"
+            );
+        }
+
+        assert_eq!(
+            select_and_validate_official_unsloth_recipe(
+                "unsloth",
+                Some("imatrix.gguf"),
+                true,
+                "affine",
+                &config,
+                Some("privacy-filter"),
+                &weight_keys,
+            )
+            .expect("calibrated privacy-filter behavior must remain available"),
+            None,
         );
     }
 
