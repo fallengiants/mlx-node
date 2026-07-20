@@ -1416,7 +1416,7 @@ fn fixup_qwen35_linear_attn(
 
 /// GGUF has no HuggingFace `model_type`, so require both a known llama.cpp
 /// Qwen3.5 architecture tag and the characteristic mixed full-attention/GDN
-/// tensor shape before enabling the official Unsloth MXFP map. `qwen3` is kept
+/// tensor shape before enabling the fixed Unsloth MXFP map. `qwen3` is kept
 /// for older Qwen3.5 writers; ordinary Qwen3 fails the weight-shape check.
 fn is_qwen35_hybrid_gguf(
     metadata: &HashMap<String, GgufMetaValue>,
@@ -1665,6 +1665,16 @@ pub struct GgufConversionResult {
     pub source_format: String,
 }
 
+fn apply_gguf_awq_prescaling(
+    weights: &mut HashMap<String, MxArray>,
+    imatrix: &crate::utils::imatrix::ImatrixData,
+) -> Result<()> {
+    crate::convert::reject_awq_for_prequantized_body(weights)?;
+    let num_layers = crate::convert::infer_num_layers_from_weights(weights);
+    crate::convert::apply_awq_prescaling(weights, imatrix, 0.5, num_layers)?;
+    Ok(())
+}
+
 #[napi]
 pub async fn convert_gguf_to_safetensors(
     options: GgufConversionOptions,
@@ -1834,11 +1844,12 @@ pub async fn convert_gguf_to_safetensors(
         }
     }
 
-    // Apply AWQ pre-scaling if imatrix provided
+    // Apply AWQ pre-scaling if imatrix provided. GGUF Q4/Q8 tensors have
+    // already been repacked to Uint32 + sidecars above, so the shared guard
+    // must run before AWQ can multiply packed integers or fold norms twice.
     if let Some(ref imatrix_path) = options.imatrix_path {
         let imatrix = crate::utils::imatrix::parse_imatrix(imatrix_path)?;
-        let num_layers = crate::convert::infer_num_layers_from_weights(&weights);
-        crate::convert::apply_awq_prescaling(&mut weights, &imatrix, 0.5, num_layers)?;
+        apply_gguf_awq_prescaling(&mut weights, &imatrix)?;
     }
 
     // Optional quantization
@@ -2128,16 +2139,14 @@ pub async fn convert_gguf_to_safetensors(
         };
 
         if do_quantize {
-            let mut quant_obj = serde_json::json!({
-                "group_size": quant_group_size_effective,
-                "bits": quant_bits,
-                "mode": quant_mode_effective,
-            });
-            if let Some(obj) = quant_obj.as_object_mut() {
-                for (path, override_val) in &per_layer_overrides {
-                    obj.insert(super::normalize_override_key(path), override_val.clone());
-                }
-            }
+            let quant_obj = crate::convert::build_quantization_object(
+                quant_bits,
+                Some(quant_group_size_effective),
+                &quant_mode_effective,
+                &per_layer_overrides,
+                /* is_privacy_filter */ false,
+                /* skip_mtp */ false,
+            );
             config_json["quantization"] = quant_obj.clone();
             config_json["quantization_config"] = quant_obj;
         } else if let Some(quant_obj) = preserved_source_quantization(&gguf)? {
@@ -2546,6 +2555,58 @@ mod tests {
             -2.0
         );
         fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn gguf_awq_rejects_repacked_body_before_mutating_weight_or_norm() {
+        let weight_key = "model.layers.0.mlp.gate_proj.weight";
+        let scale_key = "model.layers.0.mlp.gate_proj.scales";
+        let norm_key = "model.layers.0.post_attention_layernorm.weight";
+        let mut weights = HashMap::from([
+            (
+                weight_key.to_string(),
+                MxArray::from_uint32(&[0x1234_5678, 0x9abc_def0], &[1, 2]).unwrap(),
+            ),
+            (
+                scale_key.to_string(),
+                MxArray::ones(&[1, 1], Some(DType::Float16)).unwrap(),
+            ),
+            (
+                norm_key.to_string(),
+                MxArray::from_float32(&[1.25, 0.75], &[2])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap(),
+            ),
+        ]);
+        let packed_before = weights[weight_key].to_uint32().unwrap().to_vec();
+        let norm_before = weights[norm_key].to_uint16_native().unwrap();
+        let imatrix = crate::utils::imatrix::ImatrixData {
+            importance: HashMap::from([(weight_key.to_string(), vec![1.0, 4.0])]),
+            chunk_count: 1,
+            chunk_size: 2,
+        };
+
+        let err = apply_gguf_awq_prescaling(&mut weights, &imatrix)
+            .expect_err("GGUF AWQ must reject repacked Q4/Q8 storage before mutation");
+        let message = err.reason.to_string();
+        assert!(message.contains("--imatrix-path"), "{message}");
+        assert!(
+            message.contains("already-quantized model body"),
+            "{message}"
+        );
+        assert!(message.contains("before mutating tensors"), "{message}");
+        assert!(message.contains(scale_key), "{message}");
+        assert_eq!(
+            weights[weight_key].to_uint32().unwrap().to_vec(),
+            packed_before,
+            "packed GGUF payload must remain bit-exact"
+        );
+        assert_eq!(
+            weights[norm_key].to_uint16_native().unwrap(),
+            norm_before,
+            "the norm must not receive a partial AWQ fold"
+        );
     }
 
     fn gemma4_metadata() -> HashMap<String, GgufMetaValue> {
@@ -2961,7 +3022,7 @@ mod tests {
             let is_qwen35_hybrid = is_qwen35_hybrid_gguf(&metadata, &keys);
             assert!(
                 is_qwen35_hybrid,
-                "{arch} plus the hybrid shape must select the official map"
+                "{arch} plus the hybrid shape must select the fixed map"
             );
             assert_eq!(
                 crate::convert::select_official_unsloth_recipe(

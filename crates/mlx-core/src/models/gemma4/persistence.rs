@@ -14,7 +14,8 @@ use crate::engine::persistence::{
 };
 use crate::models::quant_dispatch::{
     default_per_layer_quant, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
-    load_quant_settings_from_disk, merge_per_layer, resolve_default_mode,
+    ensure_plain_fp8_storage_resolves_fp8_e4m3, load_quant_settings_from_disk, merge_per_layer,
+    resolve_default_mode,
 };
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -1279,6 +1280,59 @@ fn resolve_packed_embed_params<'a>(
     }
 }
 
+fn build_gemma_ql(
+    params: &HashMap<String, MxArray>,
+    prefix: &str,
+    plq: PerLayerQuant,
+) -> Result<Option<super::quantized_linear::QuantizedLinear>> {
+    ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
+    ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "gemma4")?;
+    Ok(match plq.mode {
+        PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
+        PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
+        PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
+        PerLayerMode::Fp8E4m3 => {
+            return Err(Error::from_reason(format!(
+                "gemma4 layer '{prefix}' resolved to fp8_e4m3, but plain per-output \
+                 E4M3 storage is supported only by Qwen3.5 DGX artifacts"
+            )));
+        }
+        PerLayerMode::Affine => {
+            try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
+        }
+        PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
+    })
+}
+
+fn build_gemma_qsl(
+    params: &HashMap<String, MxArray>,
+    prefix: &str,
+    plq: PerLayerQuant,
+) -> Result<Option<super::quantized_linear::QuantizedSwitchLinear>> {
+    ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
+    ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "gemma4")?;
+    Ok(match plq.mode {
+        PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
+        PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
+        PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
+        PerLayerMode::Fp8E4m3 => {
+            return Err(Error::from_reason(format!(
+                "gemma4 expert layer '{prefix}' resolved to fp8_e4m3, but plain \
+                 per-output E4M3 storage is supported only by Qwen3.5 DGX artifacts"
+            )));
+        }
+        PerLayerMode::Affine => {
+            try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
+        }
+        PerLayerMode::Sym8 => {
+            return Err(Error::from_reason(format!(
+                "sym8 expert layer '{prefix}': 3-D switch (expert) tensors cannot be sym8 \
+                 (convert forces experts to affine under a sym8 default) — malformed checkpoint"
+            )));
+        }
+    })
+}
+
 /// Apply sanitized weights to a Gemma4Inner.
 fn apply_weights(
     inner: &mut Gemma4Inner,
@@ -1324,46 +1378,13 @@ fn apply_weights(
     // does not transfer here.
     let try_build_ql = |prefix: &str| -> Result<Option<super::quantized_linear::QuantizedLinear>> {
         let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
-        // int8 STORAGE with non-sym8 metadata = config drift — fail loud
-        // before the int8 tensor can flow into the affine/mxfp builders.
-        ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
-        Ok(match plq.mode {
-            PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
-            PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
-            PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
-            PerLayerMode::Affine => {
-                try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
-            }
-            PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
-        })
+        build_gemma_ql(params, prefix, plq)
     };
     // Helper for expert-batched (switch) quantized linears used by MoE layers.
     let try_build_qsl =
         |prefix: &str| -> Result<Option<super::quantized_linear::QuantizedSwitchLinear>> {
             let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
-            // Same config-drift guard as `try_build_ql`: an int8 expert stack
-            // with non-sym8 metadata must not reach the affine QSL builder.
-            ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
-            Ok(match plq.mode {
-                PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
-                PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
-                PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
-                PerLayerMode::Affine => {
-                    try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
-                }
-                // 3-D expert tensors are convert-forced to affine under a
-                // sym8 default; a sym8 PLQ reaching this builder means a
-                // malformed checkpoint — fail loud, a silent fallback would
-                // read the experts' int8 bytes as dense bf16 garbage.
-                PerLayerMode::Sym8 => {
-                    return Err(Error::from_reason(format!(
-                        "sym8 expert layer '{}': 3-D switch (expert) tensors cannot be sym8 \
-                         (convert forces experts to affine under a sym8 default) — \
-                         malformed checkpoint",
-                        prefix
-                    )));
-                }
-            })
+            build_gemma_qsl(params, prefix, plq)
         };
 
     // Embedding. Q8 / Q4 affine checkpoints carry `.scales` (+ `.biases`)
@@ -2402,7 +2423,7 @@ impl Gemma4Inner {
         //   * Per-layer overrides — for mixed-recipe checkpoints
         //     (e.g. mxfp4 attention + mxfp8 MoE experts).
         let (quant_bits, quant_group_size, top_level_mode, mut per_layer_quant) =
-            load_quant_settings_from_disk(path, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE);
+            load_quant_settings_from_disk(path, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE)?;
 
         // Conversion writes per-layer overrides under split MoE expert prefixes
         // (`layers.N.experts.switch_glu.{gate,up,down}_proj`), but the
@@ -4880,6 +4901,78 @@ mod tests {
         assert!(
             err.reason.contains("affine"),
             "error mentions affine: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn gemma_ql_and_qsl_reject_plain_fp8_storage_before_packed_dispatch() {
+        let dense_prefix = "layers.0.self_attn.q_proj";
+        let dense_params = HashMap::from([
+            (
+                format!("{dense_prefix}.weight"),
+                MxArray::from_uint8(&[0; 8], &[2, 4]).unwrap(),
+            ),
+            (
+                format!("{dense_prefix}.scales"),
+                MxArray::from_float32(&[1.0, 1.0], &[2, 1]).unwrap(),
+            ),
+        ]);
+        let stale = PerLayerQuant {
+            bits: 4,
+            group_size: 32,
+            mode: PerLayerMode::Mxfp4,
+            input_amax: None,
+        };
+        let err = build_gemma_ql(&dense_params, dense_prefix, stale)
+            .err()
+            .expect("stale plain-FP8 QL metadata must reject");
+        assert!(
+            err.reason.contains("plain E4M3 FP8 storage"),
+            "{}",
+            err.reason
+        );
+
+        let explicit_fp8 = PerLayerQuant {
+            bits: 8,
+            group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
+            mode: PerLayerMode::Fp8E4m3,
+            input_amax: None,
+        };
+        let err = build_gemma_ql(&dense_params, dense_prefix, explicit_fp8)
+            .err()
+            .expect("Gemma plain-FP8 QL is unsupported");
+        assert!(
+            err.reason.contains("supported only by Qwen3.5"),
+            "{}",
+            err.reason
+        );
+
+        let expert_prefix = "layers.0.experts.gate_up_proj";
+        let expert_params = HashMap::from([
+            (
+                format!("{expert_prefix}.weight"),
+                MxArray::from_uint8(&[0; 24], &[2, 3, 4]).unwrap(),
+            ),
+            (
+                format!("{expert_prefix}.scales"),
+                MxArray::from_float32(&[1.0; 6], &[2, 3, 1]).unwrap(),
+            ),
+        ]);
+        let err = build_gemma_qsl(&expert_params, expert_prefix, stale)
+            .err()
+            .expect("stale plain-FP8 QSL metadata must reject");
+        assert!(
+            err.reason.contains("plain E4M3 FP8 storage"),
+            "{}",
+            err.reason
+        );
+        let err = build_gemma_qsl(&expert_params, expert_prefix, explicit_fp8)
+            .err()
+            .expect("Gemma plain-FP8 QSL is unsupported");
+        assert!(
+            err.reason.contains("supported only by Qwen3.5"),
+            "{}",
             err.reason
         );
     }

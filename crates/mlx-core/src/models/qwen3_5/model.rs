@@ -2032,9 +2032,45 @@ impl Qwen35Inner {
         }
     }
 
+    fn first_quantized_save_component(&self) -> Option<String> {
+        if self.embedding.is_quantized() {
+            return Some("embedding".to_string());
+        }
+        for (index, layer) in self.layers.iter().enumerate() {
+            if layer.is_quantized() {
+                return Some(format!("layers.{index}"));
+            }
+        }
+        if self
+            .lm_head
+            .as_ref()
+            .is_some_and(|head| head.is_quantized())
+        {
+            return Some("lm_head".to_string());
+        }
+        if self.mtp_weights_loaded
+            && self
+                .mtp
+                .as_ref()
+                .is_some_and(|mtp| mtp.has_quantized_weights())
+        {
+            return Some("mtp".to_string());
+        }
+        None
+    }
+
     /// Save model weights and configuration to a directory (synchronous).
     pub(crate) fn save_model_sync(&self, save_path: &str) -> Result<()> {
         use super::decoder_layer::AttentionType;
+
+        if let Some(component) = self.first_quantized_save_component() {
+            return Err(Error::from_reason(format!(
+                "Cannot save model: save_model is dense/BF16-only, but main-model component \
+                 '{component}' contains quantized projections. Refusing before creating the \
+                 destination because packed weights require sidecars and quantization metadata \
+                 that this save format cannot preserve losslessly."
+            )));
+        }
 
         let mut params = HashMap::new();
 
@@ -2148,22 +2184,10 @@ impl Qwen35Inner {
         if self.mtp_weights_loaded
             && let Some(ref mtp) = self.mtp
         {
-            // `save_model_sync` is dense/bf16-only (it serializes the dense
-            // weight slot and NaN-validates via `to_float32()`). A quantized
-            // MTP head's dense slot is not a faithful bf16 copy of the
-            // quantized payload (packed uint32 for the per-layer linears, a
-            // lossy dequant for `fc`) — emitting it would masquerade as a
-            // valid bf16 head on reload, strictly worse than the clean-drop
-            // behavior. Skip + warn.
-            if mtp.has_quantized_weights() {
-                warn!(
-                    "Skipping MTP head serialization: the loaded MTP weights are quantized and \
-                     save_model_sync is dense/bf16-only. The reloaded checkpoint will run \
-                     autoregressive-only (no speculative MTP)."
-                );
-            } else {
-                params.extend(mtp.get_parameters());
-            }
+            // The early fail-closed quantized-state gate above guarantees this
+            // MTP head is dense; partial omission would make the saved model
+            // silently lose speculative decoding.
+            params.extend(mtp.get_parameters());
         }
 
         // Validate for NaN/Inf
@@ -12549,6 +12573,9 @@ mod paged_construction_tests {
     use crate::array::DType;
     use crate::models::qwen3_5::config::Qwen3_5Config;
     use crate::models::qwen3_5::decoder_layer::{self, AttentionType};
+    use crate::models::qwen3_5::quantized_linear::{
+        MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE, QuantizedLinear,
+    };
 
     fn tiny_cfg(use_block_paged: bool) -> Qwen3_5Config {
         Qwen3_5Config {
@@ -12593,6 +12620,47 @@ mod paged_construction_tests {
         cfg.linear_value_head_dim = 32;
         cfg.paged_cache_memory_mb = Some(256);
         cfg
+    }
+
+    #[test]
+    fn save_model_rejects_quantized_dense_projection_before_creating_destination() {
+        let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+        let weight = MxArray::zeros(&[128, 16], Some(DType::Uint32)).unwrap();
+        let scales = MxArray::zeros(&[128, 2], Some(DType::Uint8)).unwrap();
+        let quantized = QuantizedLinear::new(
+            weight,
+            scales,
+            None,
+            None,
+            MXFP8_GROUP_SIZE,
+            MXFP8_BITS,
+            MXFP8_MODE.to_string(),
+        );
+        match &mut inner.layers[3].attn {
+            AttentionType::Full(attn) => attn.set_quantized_q_proj(quantized),
+            AttentionType::Linear(_) => panic!("layer 3 must be full attention"),
+        }
+
+        let destination = std::env::temp_dir().join(format!(
+            "mlx_node_dense_quant_save_reject_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!destination.exists());
+        let err = inner
+            .save_model_sync(destination.to_str().unwrap())
+            .expect_err("quantized main-model projection must reject dense-only save");
+        let message = err.reason.to_string();
+        assert!(message.contains("dense/BF16-only"), "{message}");
+        assert!(message.contains("layers.3"), "{message}");
+        assert!(message.contains("before creating"), "{message}");
+        assert!(
+            !destination.exists(),
+            "rejected save must not create its destination directory"
+        );
     }
 
     fn paged_inner_or_skip(test_name: &str) -> Option<(Qwen35Inner, Qwen3_5Config)> {

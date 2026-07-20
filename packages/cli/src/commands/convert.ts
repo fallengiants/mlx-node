@@ -55,7 +55,7 @@ Quantization Arguments:
                         K%16!=0 layers fall back to 8-bit affine (or bf16)
                         with per-layer overrides. NOT mlx-lm-loadable.
   --q-mxfp              Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
-                        With --q-recipe unsloth, selects the fixed official
+                        With --q-recipe unsloth, selects the fixed Unsloth
                         Qwen3.5 MXFP map: early FFNs=mxfp4; final eight FFNs,
                         attention q/k/v/o, GDN qkv/z/out, and lm_head=mxfp8;
                         embeddings, routers, GDN a/b, vision, MTP, norms, and
@@ -91,12 +91,18 @@ Quantization Arguments:
                         The fixed --q-mxfp / --q-mode nvfp4 maps may omit it;
                         AWQ pre-scaling is then skipped and quality may be lower.
                         A matching imatrix remains preferred when available.
-                        Add --q-mxfp for the official Qwen3.5 MXFP class map
+                        Add --q-mxfp for the fixed Qwen3.5 MXFP class map
                         (NVFP4 translated to MXFP4, FP8 translated to MXFP8).
-                        Use --q-mode nvfp4 for the official DGX map: early
+                        Use --q-mode nvfp4 for the fixed DGX weight map: early
                         FFNs=nvfp4; final eight FFNs, attention/GDN high
-                        classes, and lm_head=mxfp8; the same protected classes
-                        stay bf16. Plain affine keeps legacy Dynamic 2.0.
+                        classes, and lm_head=fp8_e4m3 (raw E4M3 weights with
+                        per-output float scales); the same protected classes
+                        stay bf16. Both DGX classes run with A16 activations:
+                        NVFP4 uses standard MLX weight-only quantized matmul;
+                        plain FP8 reconstructs bf16 weights at load. This does
+                        not preserve Unsloth's calibrated W4A4/W8A8 execution,
+                        global scales, or calibrated FP8 KV cache.
+                        Plain affine keeps legacy Dynamic 2.0.
                         "nvidia" is a data-free MXFP4 port of NVIDIA modelopt's
                         recipe (dense qwen3_5 + MoE qwen3_5_moe): FFN + lm_head
                         =mxfp4 4/32, attn q/k/v/o + GDN in_proj_qkv/z/out_proj
@@ -301,7 +307,7 @@ export async function run(argv: string[]) {
     // in_proj_a/in_proj_b at 8-bit affine for MTP/AR T=0 bit-exactness).
     // Based on Unsloth's per-tensor KLD analysis. Legacy affine requires an
     // imatrix for AWQ correction on attention/SSM projections. The fixed
-    // official --q-mxfp / --q-mode nvfp4 maps may run data-free, but the
+    // --q-mxfp / --q-mode nvfp4 tensor-class maps may run data-free, but the
     // backend must still verify the Qwen family + hybrid tensor shape before
     // it is allowed to skip AWQ rather than fall back to Dynamic 2.0.
     if (quantRecipe === 'unsloth' && !args['q-bits'] && quantMode !== 'nvfp4' && !args['q-mxfp']) {
@@ -312,13 +318,13 @@ export async function run(argv: string[]) {
       if (!requestsFixedOfficialMap) {
         console.error('Error: legacy affine --q-recipe unsloth requires --imatrix-path for AWQ pre-scaling');
         console.error(
-          '       without calibration, only the fixed official maps selected by --q-mxfp or --q-mode nvfp4 are supported',
+          '       without calibration, only the fixed tensor-class maps selected by --q-mxfp or --q-mode nvfp4 are supported',
         );
         console.error('       Generate with: llama-imatrix -m model.gguf -f calibration.txt -o imatrix.gguf');
         process.exit(1);
       }
       console.warn(
-        'Warning: no --imatrix-path was provided. If backend Qwen family/shape validation selects the requested fixed MXFP4/MXFP8 or NVFP4/MXFP8 map, AWQ pre-scaling will be skipped and quality may be lower; unsupported inputs will be rejected.',
+        'Warning: no --imatrix-path was provided. If backend Qwen family/shape validation selects the requested fixed MXFP4/MXFP8 or NVFP4/plain-FP8 map, AWQ pre-scaling will be skipped and quality may be lower; unsupported inputs will be rejected.',
       );
     }
     // The nvidia recipe is a data-free port with a fixed format map: it reads
@@ -363,10 +369,12 @@ export async function run(argv: string[]) {
   const effectiveQuantBits = quantBits ?? (quantMode === 'nvfp4' ? 4 : quantRecipe === 'unsloth' ? 3 : undefined);
   const usesOfficialUnslothMxfp = quantRecipe === 'unsloth' && args['q-mxfp'];
   const usesOfficialUnslothNvfp4 = quantRecipe === 'unsloth' && quantMode === 'nvfp4';
-  const officialUnslothSummary = (lowFormat: 'mxfp4' | 'nvfp4') =>
-    `official Unsloth ${lowFormat === 'nvfp4' ? 'DGX/NVFP4' : 'MXFP'} map (early FFN=${lowFormat}; final 8 FFN + attention/GDN/head=mxfp8; protected classes=bf16)`;
-  const requestedOfficialUnslothSummary = (lowFormat: 'mxfp4' | 'nvfp4') =>
-    `requested ${officialUnslothSummary(lowFormat)}; backend verifies Qwen family/shape`;
+  const fixedUnslothSummary = (lowFormat: 'mxfp4' | 'nvfp4') => {
+    const highFormat = lowFormat === 'nvfp4' ? 'fp8_e4m3' : 'mxfp8';
+    return `fixed Unsloth ${lowFormat === 'nvfp4' ? 'DGX/NVFP4 weight' : 'MXFP'} map (early FFN=${lowFormat}; final 8 FFN + attention/GDN/head=${highFormat}; protected classes=bf16)`;
+  };
+  const requestedFixedUnslothSummary = (lowFormat: 'mxfp4' | 'nvfp4') =>
+    `requested ${fixedUnslothSummary(lowFormat)}; backend verifies Qwen family/shape`;
   // Render the `Quantize:` line body shared by the GGUF and SafeTensors paths.
   // `qGsLabel` carries the group-size text (the GGUF path never reaches sym8,
   // so it always passes `group_size=N`); `mtp` is `'off'` on the GGUF path,
@@ -374,10 +382,10 @@ export async function run(argv: string[]) {
   const formatQuantizeSummary = (qBits: number, qMode: string, qGsLabel: string, mtp: string): string => {
     const mtpSuffix = mtp !== 'off' ? `, mtp=${mtp}` : '';
     if (usesOfficialUnslothMxfp) {
-      return `${requestedOfficialUnslothSummary('mxfp4')}, recipe=unsloth${mtpSuffix}`;
+      return `${requestedFixedUnslothSummary('mxfp4')}, recipe=unsloth${mtpSuffix}`;
     }
     if (usesOfficialUnslothNvfp4) {
-      return `${requestedOfficialUnslothSummary('nvfp4')}, recipe=unsloth${mtpSuffix}`;
+      return `${requestedFixedUnslothSummary('nvfp4')}, recipe=unsloth${mtpSuffix}`;
     }
     const qMxfpSuffix = args['q-mxfp']
       ? ', --q-mxfp: eligible 8b->mxfp8/4b->mxfp4 (protected affine keys stay affine)'
