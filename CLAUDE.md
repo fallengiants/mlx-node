@@ -21,6 +21,7 @@ There are already some wild used inference implementations for your reference:
 - [docs/ffi-cpp.md](docs/ffi-cpp.md) — C++ FFI bridge, compiled Qwen3.5 forward paths, Metal shaders
 - [docs/perf.md](docs/perf.md) — Profiling, env-var inventory, GPU arch detection, quantization
 - [docs/cli.md](docs/cli.md) — `mlx download`, `mlx convert`, `mlx launch claude`
+- [docs/convert-quantize.md](docs/convert-quantize.md) — Convert/quantize internals: on-disk formats, recipe decision engine, GGUF import, provenance, gotchas
 
 ## Build, test, lint
 
