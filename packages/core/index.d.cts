@@ -204,8 +204,8 @@ export declare class Gemma4Model {
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
    * sole authority for the rendered suffix; native cache reuse
-   * occurs only when the new render strictly extends the saved
-   * token history.
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
@@ -525,8 +525,8 @@ export declare class Lfm2Model {
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
    * sole authority for the rendered suffix; native cache reuse
-   * occurs only when the new render strictly extends the saved
-   * token history.
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
@@ -1172,8 +1172,8 @@ export declare class Qwen35Model {
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
    * sole authority for the rendered suffix; native cache reuse
-   * occurs only when the new render strictly extends the saved
-   * token history.
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
@@ -1287,8 +1287,8 @@ export declare class Qwen35MoeModel {
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
    * sole authority for the rendered suffix; native cache reuse
-   * occurs only when the new render strictly extends the saved
-   * token history.
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
@@ -1451,8 +1451,8 @@ export declare class Qwen3Model {
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
    * sole authority for the rendered suffix; native cache reuse
-   * occurs only when the new render strictly extends the saved
-   * token history.
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
