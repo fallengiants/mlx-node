@@ -47,6 +47,12 @@ struct StreamingHooks<'a> {
     cancelled: &'a AtomicBool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnKind {
+    Start,
+    Continue,
+}
+
 // =====================================================================
 // Sync entry points
 // =====================================================================
@@ -71,17 +77,23 @@ pub(crate) fn session_start<B: ChatBackend>(
             "chat_session_start requires reuse_cache=true (pass ChatConfig { reuse_cache: Some(true), .. } or leave as None). The session API only makes sense with cache reuse enabled.",
         ));
     }
-    expect_sync_result(chat_turn_core(backend, messages, config, None))
+    expect_sync_result(chat_turn_core(
+        backend,
+        messages,
+        config,
+        TurnKind::Start,
+        None,
+    ))
 }
 
 /// Generic role-aware session continuation.
 ///
 /// The caller supplies the complete structured conversation, including
 /// the pending user message. The model-provided chat template renders that
-/// full history, then the normal fresh-turn prefix verifier either reuses
-/// the exact cached token prefix and prefills only the suffix, or resets and
-/// safely replays the full prompt. No Rust-side wire-format delta is
-/// synthesized.
+/// full history. When the completed structured history exactly describes the
+/// live cache, the core preserves the committed token IDs and appends only
+/// the template-authored remainder; otherwise it resets and safely replays the
+/// full prompt.
 pub(crate) fn session_continue<B: ChatBackend>(
     backend: &mut B,
     messages: Vec<ChatMessage>,
@@ -98,14 +110,20 @@ pub(crate) fn session_continue<B: ChatBackend>(
             "chat_session_continue requires an initialized session (call chatSessionStart first)",
         ));
     }
-    expect_sync_result(chat_turn_core(backend, messages, config, None))
+    expect_sync_result(chat_turn_core(
+        backend,
+        messages,
+        config,
+        TurnKind::Continue,
+        None,
+    ))
 }
 
 /// Generic role-aware tool-result continuation.
 ///
 /// Like [`session_continue`], the caller supplies the complete history,
 /// now ending in the pending tool-role message. The loaded chat template is
-/// the sole authority for tool-call/result layout.
+/// the sole authority for the appended tool-call/result layout.
 pub(crate) fn session_continue_tool<B: ChatBackend>(
     backend: &mut B,
     messages: Vec<ChatMessage>,
@@ -122,7 +140,13 @@ pub(crate) fn session_continue_tool<B: ChatBackend>(
             "chat_session_continue_tool requires an initialized session (call chatSessionStart first)",
         ));
     }
-    expect_sync_result(chat_turn_core(backend, messages, config, None))
+    expect_sync_result(chat_turn_core(
+        backend,
+        messages,
+        config,
+        TurnKind::Continue,
+        None,
+    ))
 }
 
 // =====================================================================
@@ -157,6 +181,7 @@ pub(crate) fn session_start_stream<B: ChatBackend>(
         backend,
         messages,
         config,
+        TurnKind::Start,
         Some(StreamingHooks { sink, cancelled }),
     ) {
         sink.send(Err(e));
@@ -194,6 +219,7 @@ pub(crate) fn session_continue_stream<B: ChatBackend>(
         backend,
         messages,
         config,
+        TurnKind::Continue,
         Some(StreamingHooks { sink, cancelled }),
     ) {
         sink.send(Err(e));
@@ -231,6 +257,7 @@ pub(crate) fn session_continue_tool_stream<B: ChatBackend>(
         backend,
         messages,
         config,
+        TurnKind::Continue,
         Some(StreamingHooks { sink, cancelled }),
     ) {
         sink.send(Err(e));
@@ -332,6 +359,431 @@ fn extract_audio_from_messages(messages: &[ChatMessage]) -> Vec<Vec<u8>> {
     all_audio
 }
 
+fn media_capabilities_from_messages(messages: &[ChatMessage]) -> MediaCapabilities {
+    MediaCapabilities {
+        images: messages.iter().any(|message| {
+            message
+                .images
+                .as_ref()
+                .is_some_and(|images| !images.is_empty())
+        }),
+        audio: messages.iter().any(|message| {
+            message
+                .audio
+                .as_ref()
+                .is_some_and(|clips| !clips.is_empty())
+        }),
+    }
+}
+
+/// Verify that the caller-supplied completed transcript describes the exact
+/// media payloads encoded by the live cache.
+///
+/// Matching only modality presence is insufficient because chat templates
+/// render different image/audio byte payloads to the same placeholder tokens.
+/// Text-only histories need no payload proof; media histories fail closed
+/// unless the backend can match its stored cache key or digest.
+pub(super) fn live_history_media_matches<B: ChatBackend>(
+    backend: &B,
+    completed_history: &[ChatMessage],
+) -> bool {
+    let history_media = media_capabilities_from_messages(completed_history);
+    if backend.session_media() != history_media {
+        return false;
+    }
+    if history_media.is_empty() {
+        return true;
+    }
+
+    let images = extract_images_from_messages(completed_history);
+    let audio = extract_audio_from_messages(completed_history);
+    backend.session_media_matches_payloads(&images, &audio)
+}
+
+const THINK_END: &str = "</think>";
+
+#[derive(Debug, PartialEq, Eq)]
+struct StructuredReasoningBoundary {
+    ordinal: usize,
+    reasoning: String,
+    content: String,
+}
+
+fn copy_message_with_reasoning(
+    message: &ChatMessage,
+    reasoning_content: Option<String>,
+) -> ChatMessage {
+    ChatMessage {
+        role: message.role.clone(),
+        content: message.content.clone(),
+        tool_calls: message.tool_calls.clone(),
+        tool_call_id: message.tool_call_id.clone(),
+        is_error: message.is_error,
+        reasoning_content,
+        thinking_enabled: message.thinking_enabled,
+        images: message.images.as_ref().map(|images| {
+            images
+                .iter()
+                .map(|image| Uint8Array::with_data_copied(image.as_ref()))
+                .collect()
+        }),
+        audio: message.audio.as_ref().map(|clips| {
+            clips
+                .iter()
+                .map(|clip| Uint8Array::with_data_copied(clip.as_ref()))
+                .collect()
+        }),
+    }
+}
+
+/// Locate close tags that were emitted from structured assistant reasoning.
+///
+/// The shadow render replaces each non-empty `reasoning_content` field with a
+/// unique sentinel. If the original and shadow renders differ only at those
+/// exact sentinel spans, the following `</think>` tags have role/template
+/// provenance. A template that transforms the reasoning field in any other way
+/// fails closed instead of authorizing a looser history comparison.
+fn structured_reasoning_boundary_ordinals(
+    tokenizer: &crate::tokenizer::Qwen3Tokenizer,
+    completed_history: &[ChatMessage],
+    config: &ChatConfig,
+) -> Result<Option<Vec<StructuredReasoningBoundary>>> {
+    let completed_template = tokenizer.render_chat_template_sync(
+        completed_history,
+        Some(false),
+        config.tools.as_deref(),
+        crate::engine::params::resolve_enable_thinking(config),
+    )?;
+    let salt = (0usize..)
+        .find(|salt| !completed_template.contains(&format!("__MLX_REASONING_PROVENANCE_{salt}_")))
+        .expect("an unbounded numeric salt must produce a unique sentinel");
+
+    let mut replacements = Vec::new();
+    let mut shadow_history = Vec::with_capacity(completed_history.len());
+    for (message_index, message) in completed_history.iter().enumerate() {
+        let replacement = message
+            .reasoning_content
+            .as_ref()
+            .filter(|reasoning| {
+                !reasoning.is_empty() && message.role.trim().eq_ignore_ascii_case("assistant")
+            })
+            .map(|reasoning| {
+                let sentinel = format!("__MLX_REASONING_PROVENANCE_{salt}_{message_index}__");
+                replacements.push((sentinel.clone(), reasoning.clone(), message.content.clone()));
+                sentinel
+            });
+        shadow_history.push(copy_message_with_reasoning(
+            message,
+            replacement.or_else(|| message.reasoning_content.clone()),
+        ));
+    }
+    if replacements.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let shadow_template = tokenizer.render_chat_template_sync(
+        &shadow_history,
+        Some(false),
+        config.tools.as_deref(),
+        crate::engine::params::resolve_enable_thinking(config),
+    )?;
+    let mut rendered_replacements = Vec::new();
+    for replacement in replacements {
+        match shadow_template.matches(&replacement.0).count() {
+            0 => {}
+            1 => rendered_replacements.push(replacement),
+            _ => return Ok(None),
+        }
+    }
+
+    let Some(boundary_positions) = locate_structured_reasoning_boundaries(
+        &completed_template,
+        &shadow_template,
+        &rendered_replacements,
+    ) else {
+        return Ok(None);
+    };
+    let all_tag_positions = completed_template
+        .match_indices(THINK_END)
+        .map(|(position, _)| position)
+        .collect::<Vec<_>>();
+    let mut boundaries = Vec::with_capacity(boundary_positions.len());
+    for (position, (_, reasoning, content)) in
+        boundary_positions.into_iter().zip(rendered_replacements)
+    {
+        let Ok(ordinal) = all_tag_positions.binary_search(&position) else {
+            return Ok(None);
+        };
+        boundaries.push(StructuredReasoningBoundary {
+            ordinal,
+            reasoning,
+            content,
+        });
+    }
+    Ok(Some(boundaries))
+}
+
+fn locate_structured_reasoning_boundaries(
+    original: &str,
+    shadow: &str,
+    replacements: &[(String, String, String)],
+) -> Option<Vec<usize>> {
+    let mut original_cursor = 0usize;
+    let mut shadow_cursor = 0usize;
+    let mut boundaries = Vec::with_capacity(replacements.len());
+    for (sentinel, reasoning, _) in replacements {
+        let sentinel_offset = shadow[shadow_cursor..].find(sentinel)?;
+        let sentinel_start = shadow_cursor + sentinel_offset;
+        let common_prefix = &shadow[shadow_cursor..sentinel_start];
+        if !original[original_cursor..].starts_with(common_prefix) {
+            return None;
+        }
+        original_cursor += common_prefix.len();
+        shadow_cursor = sentinel_start + sentinel.len();
+
+        if !original[original_cursor..].starts_with(reasoning) {
+            return None;
+        }
+        original_cursor += reasoning.len();
+
+        let close_offset = shadow[shadow_cursor..].find(THINK_END)?;
+        let before_close = &shadow[shadow_cursor..shadow_cursor + close_offset];
+        if !original[original_cursor..].starts_with(before_close) {
+            return None;
+        }
+        original_cursor += before_close.len();
+        shadow_cursor += close_offset;
+        if !original[original_cursor..].starts_with(THINK_END)
+            || !shadow[shadow_cursor..].starts_with(THINK_END)
+        {
+            return None;
+        }
+        boundaries.push(original_cursor);
+        original_cursor += THINK_END.len();
+        shadow_cursor += THINK_END.len();
+    }
+    (original[original_cursor..] == shadow[shadow_cursor..]).then_some(boundaries)
+}
+
+/// Verify caller-owned reasoning/content bytes against the committed cache
+/// before any template-separator normalization.
+///
+/// A cached prefix may end before a later reasoning close (length exit), in
+/// which case the ordinary prefix comparison remains authoritative. Once a
+/// proven close tag is present, however, the structured message fields must
+/// match exactly. Leading assistant-content whitespace is rejected rather than
+/// ambiguously treating it as separator whitespace.
+fn cached_structured_reasoning_matches(
+    cached_text: &str,
+    boundaries: &[StructuredReasoningBoundary],
+) -> bool {
+    let tag_positions = cached_text
+        .match_indices(THINK_END)
+        .map(|(position, _)| position)
+        .collect::<Vec<_>>();
+    for boundary in boundaries {
+        let Some(&tag_start) = tag_positions.get(boundary.ordinal) else {
+            continue;
+        };
+        if boundary
+            .reasoning
+            .ends_with(|character: char| character.is_ascii_whitespace())
+        {
+            return false;
+        }
+        let before_tag = cached_text[..tag_start]
+            .trim_end_matches(|character: char| character.is_ascii_whitespace());
+        if !before_tag.ends_with(&boundary.reasoning) {
+            return false;
+        }
+        if !boundary.content.is_empty() {
+            let after_tag = &cached_text[tag_start + THINK_END.len()..];
+            let after_separator =
+                after_tag.trim_start_matches(|character: char| character.is_ascii_whitespace());
+            if boundary
+                .content
+                .starts_with(|character: char| character.is_ascii_whitespace())
+            {
+                return false;
+            }
+            let content_matches = if after_separator.len() >= boundary.content.len() {
+                after_separator.starts_with(&boundary.content)
+            } else {
+                boundary.content.starts_with(after_separator)
+            };
+            if !content_matches {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Normalize whitespace only around reasoning-close tags whose structured
+/// assistant/template provenance was established above, retaining a map from
+/// normalized byte boundaries back to the original text.
+///
+/// Checkpoint templates commonly render `\n</think>\n\n`, while the committed
+/// generated tokens can carry `</think>\n`. Those byte layouts describe the
+/// same reasoning boundary but are not prefix-equal. Literal tags in user or
+/// ordinary assistant content are never selected.
+fn normalize_reasoning_boundaries(
+    text: &str,
+    reasoning_boundary_ordinals: &[usize],
+    require_all_boundaries: bool,
+) -> Option<(String, Vec<usize>)> {
+    let bytes = text.as_bytes();
+    let mut omitted = vec![false; bytes.len()];
+    let selected = reasoning_boundary_ordinals
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut found = 0usize;
+    for (ordinal, (tag_start, _)) in text.match_indices(THINK_END).enumerate() {
+        if !selected.contains(&ordinal) {
+            continue;
+        }
+        found += 1;
+        let mut before = tag_start;
+        while before > 0 && bytes[before - 1].is_ascii_whitespace() {
+            before -= 1;
+            omitted[before] = true;
+        }
+
+        let mut after = tag_start + THINK_END.len();
+        while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+            omitted[after] = true;
+            after += 1;
+        }
+    }
+    if require_all_boundaries && found != selected.len() {
+        return None;
+    }
+
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut source_boundaries = Vec::with_capacity(bytes.len() + 1);
+    source_boundaries.push(0);
+    for (index, &byte) in bytes.iter().enumerate() {
+        if omitted[index] {
+            *source_boundaries
+                .last_mut()
+                .expect("the initial boundary is always present") = index + 1;
+        } else {
+            normalized.push(byte);
+            source_boundaries.push(index + 1);
+        }
+    }
+
+    Some((
+        String::from_utf8(normalized).expect("removing ASCII whitespace preserves valid UTF-8"),
+        source_boundaries,
+    ))
+}
+
+/// Reconstruct a live continuation from the exact committed token IDs plus
+/// the suffix authored by the checkpoint template.
+///
+/// Generated text is not a lossless token-history format: decoding and then
+/// re-encoding the same bytes may choose a different BPE segmentation, and a
+/// length-truncated reasoning turn has no closing tag for a template to
+/// reproduce. A full structured re-render can therefore describe the same
+/// conversation while failing the exact token-prefix check required by live
+/// KV reuse.
+///
+/// To keep the template authoritative, render both the completed history and
+/// the full history including the pending user/tool message. Compare the live
+/// history in the template's logical placeholder form and normalize only
+/// template-owned reasoning-boundary whitespace, then append the mapped
+/// template remainder to the original cached token IDs. Any edited or
+/// incompatible history fails these checks and returns `None`, making the
+/// caller safely cold-replay the complete render.
+fn render_live_continuation<B: ChatBackend>(
+    backend: &B,
+    tokenizer: &crate::tokenizer::Qwen3Tokenizer,
+    messages: &[ChatMessage],
+    config: &ChatConfig,
+    full_tokens: &[u32],
+) -> Result<Option<Vec<u32>>> {
+    let Some((_pending, completed_history)) = messages.split_last() else {
+        return Ok(None);
+    };
+    let cached_tokens = backend.cached_token_history();
+    if completed_history.is_empty() || cached_tokens.is_empty() {
+        return Ok(None);
+    }
+    if !live_history_media_matches(backend, completed_history) {
+        return Ok(None);
+    }
+
+    let completed_tokens = tokenizer.apply_chat_template_sync(
+        completed_history,
+        Some(false),
+        config.tools.as_deref(),
+        crate::engine::params::resolve_enable_thinking(config),
+    )?;
+    let cached_comparison_tokens = backend.template_history_comparison_tokens(cached_tokens);
+    let cached_text = tokenizer.decode_sync(&cached_comparison_tokens, false)?;
+    let completed_text = tokenizer.decode_sync(&completed_tokens, false)?;
+    let full_text = tokenizer.decode_sync(full_tokens, false)?;
+    let Some(reasoning_boundaries) =
+        structured_reasoning_boundary_ordinals(tokenizer, completed_history, config)?
+    else {
+        return Ok(None);
+    };
+    if !cached_structured_reasoning_matches(&cached_text, &reasoning_boundaries) {
+        return Ok(None);
+    }
+    let reasoning_boundary_ordinals = reasoning_boundaries
+        .iter()
+        .map(|boundary| boundary.ordinal)
+        .collect::<Vec<_>>();
+    let Some((cached_comparison_text, _)) =
+        normalize_reasoning_boundaries(&cached_text, &reasoning_boundary_ordinals, false)
+    else {
+        return Ok(None);
+    };
+    let Some((completed_comparison_text, _)) =
+        normalize_reasoning_boundaries(&completed_text, &reasoning_boundary_ordinals, true)
+    else {
+        return Ok(None);
+    };
+    let Some((full_comparison_text, full_source_boundaries)) =
+        normalize_reasoning_boundaries(&full_text, &reasoning_boundary_ordinals, true)
+    else {
+        return Ok(None);
+    };
+
+    if !completed_comparison_text.starts_with(&cached_comparison_text)
+        || !full_comparison_text.starts_with(&completed_comparison_text)
+    {
+        return Ok(None);
+    }
+
+    let suffix_start = full_source_boundaries[cached_comparison_text.len()];
+    let suffix_text = &full_text[suffix_start..];
+    let suffix_tokens = tokenizer.encode_sync(suffix_text, Some(false))?;
+    let mut continuation = Vec::with_capacity(cached_tokens.len() + suffix_tokens.len());
+    continuation.extend_from_slice(cached_tokens);
+    continuation.extend_from_slice(&suffix_tokens);
+
+    // Tokenizer decoders can normalize byte sequences. Only use the splice
+    // when the combined IDs still decode to the same logical placeholder and
+    // reasoning-boundary form as the full template render; otherwise fall
+    // back to the ordinary cold replay.
+    let continuation_comparison_tokens = backend.template_history_comparison_tokens(&continuation);
+    let continuation_text = tokenizer.decode_sync(&continuation_comparison_tokens, false)?;
+    let Some((continuation_comparison_text, _)) =
+        normalize_reasoning_boundaries(&continuation_text, &reasoning_boundary_ordinals, true)
+    else {
+        return Ok(None);
+    };
+    if continuation_comparison_text != full_comparison_text {
+        return Ok(None);
+    }
+
+    Ok(Some(continuation))
+}
+
 // =====================================================================
 // The turn core
 // =====================================================================
@@ -347,6 +799,7 @@ fn chat_turn_core<B: ChatBackend>(
     backend: &mut B,
     messages: Vec<ChatMessage>,
     config: ChatConfig,
+    turn_kind: TurnKind,
     streaming: Option<StreamingHooks<'_>>,
 ) -> Result<Option<ChatResult>> {
     // --- tokenizer + session EOS + thinking state ---
@@ -397,7 +850,49 @@ fn chat_turn_core<B: ChatBackend>(
     // inside the multimodal executor — skip the rejection, render normally,
     // and route through the multimodal executor below with these exact
     // extracted images (single extraction — no drift).
-    let images = extract_images_from_messages(&messages);
+    let pending_messages = match turn_kind {
+        TurnKind::Start => messages.as_slice(),
+        TurnKind::Continue => messages.last().map(std::slice::from_ref).unwrap_or(&[]),
+    };
+    let pending_media = media_capabilities_from_messages(pending_messages);
+    if pending_media.images && turn_kind == TurnKind::Continue {
+        return Err(Error::from_reason(format!(
+            "{IMAGE_CHANGE_RESTART_PREFIX} continuation messages cannot replace the media held by the live session",
+        )));
+    }
+    if pending_media.images && !admitted_media.images {
+        return Err(Error::from_reason(format!(
+            "{IMAGE_CHANGE_RESTART_PREFIX} this model is text-only; image messages are not supported",
+        )));
+    }
+    if pending_media.audio && turn_kind == TurnKind::Continue {
+        return Err(Error::from_reason(format!(
+            "{IMAGE_CHANGE_RESTART_PREFIX} continuation messages cannot replace the media held by the live session",
+        )));
+    }
+    if pending_media.audio && !admitted_media.audio {
+        return Err(Error::from_reason(format!(
+            "{IMAGE_CHANGE_RESTART_PREFIX} this model has no audio support; audio messages are not supported",
+        )));
+    }
+
+    let full_tokens = backend.render_prompt(&tokenizer, &messages, &config)?;
+    let live_continuation = if turn_kind == TurnKind::Continue {
+        render_live_continuation(backend, &tokenizer, &messages, &config, &full_tokens)?
+    } else {
+        None
+    };
+    let is_delta = live_continuation.is_some();
+    let tokens = live_continuation.unwrap_or(full_tokens);
+
+    // A successful live splice carries only a text suffix on top of existing
+    // session state. A cold replay must feed every historical media payload
+    // back through the model.
+    let images = if is_delta {
+        Vec::new()
+    } else {
+        extract_images_from_messages(&messages)
+    };
     if !images.is_empty() && !admitted_media.images {
         return Err(Error::from_reason(format!(
             "{IMAGE_CHANGE_RESTART_PREFIX} this model is text-only; image messages are not supported",
@@ -407,26 +902,33 @@ fn chat_turn_core<B: ChatBackend>(
     // with no audio support is rejected with the typed restart prefix before
     // `render_prompt`. Every non-audio family rejects here and image-only /
     // text-only flows stay byte-identical.
-    let audio = extract_audio_from_messages(&messages);
+    let audio = if is_delta {
+        Vec::new()
+    } else {
+        extract_audio_from_messages(&messages)
+    };
     if !audio.is_empty() && !admitted_media.audio {
         return Err(Error::from_reason(format!(
             "{IMAGE_CHANGE_RESTART_PREFIX} this model has no audio support; audio messages are not supported",
         )));
     }
-    let tokens = backend.render_prompt(&tokenizer, &messages, &config)?;
-
     let media = MediaInputs {
         images: &images,
         audio: &audio,
     };
     let input_media = media.capabilities();
-    // A full-history request describes its own context; stale state from a
-    // previous session must not constrain the new plan.
-    let context_media = MediaCapabilities::NONE;
+    // A live continuation adds no new media but may reuse image/audio state
+    // already encoded in the held caches. A cold full-history replay owns all
+    // current media itself.
+    let context_media = if is_delta {
+        backend.session_media()
+    } else {
+        MediaCapabilities::NONE
+    };
     let turn_plan = TurnPlan::resolve(
         execution,
         TurnRequest {
-            is_delta: false,
+            is_delta,
             input_media,
             context_media,
             speculative_requested: p.enable_mtp,
@@ -523,7 +1025,7 @@ fn chat_turn_core<B: ChatBackend>(
         .map(|bytes| crate::stream::WiredLimitContext::new(bytes, vec![generation_stream]));
 
     let mut profiler = DecodeProfiler::new(
-        backend.profiler_label(false, streaming.is_some()),
+        backend.profiler_label(is_delta, streaming.is_some()),
         backend.family_name(),
     );
     profiler.set_prompt_tokens(prefill_tokens.len() as u32);
@@ -576,7 +1078,7 @@ fn chat_turn_core<B: ChatBackend>(
         {
             let turn_setup = TurnSetup {
                 params: &p,
-                is_delta: false,
+                is_delta,
                 // The generic flow is text-only; image turns routed through
                 // the multimodal executor above.
                 has_images: false,
@@ -651,7 +1153,7 @@ fn chat_turn_core<B: ChatBackend>(
     // --- save cache state ---
     backend.save_cache_state(SaveStateArgs {
         reuse_cache,
-        is_delta: false,
+        is_delta,
         has_images: false,
         generated_tokens: &generated_tokens,
         finish_reason: &finish_reason,
@@ -745,4 +1247,118 @@ fn chat_turn_core<B: ChatBackend>(
     }
 
     Ok(Some(result))
+}
+
+#[cfg(test)]
+mod continuation_comparison_tests {
+    use super::{
+        StructuredReasoningBoundary, cached_structured_reasoning_matches,
+        locate_structured_reasoning_boundaries, normalize_reasoning_boundaries,
+    };
+
+    #[test]
+    fn reasoning_boundary_normalization_maps_back_to_the_exact_suffix() {
+        let cached = "a</think>\n</think>\n\nbody for";
+        let full = "a\n</think>\n\n</think>\n\nbody for the<|im_end|>\n";
+        let (cached_normalized, _) =
+            normalize_reasoning_boundaries(cached, &[0], true).expect("cached boundary exists");
+        let (full_normalized, full_boundaries) =
+            normalize_reasoning_boundaries(full, &[0], true).expect("full boundary exists");
+
+        assert!(full_normalized.starts_with(&cached_normalized));
+        let suffix_start = full_boundaries[cached_normalized.len()];
+        assert_eq!(&full[suffix_start..], " the<|im_end|>\n");
+    }
+
+    #[test]
+    fn reasoning_boundary_normalization_preserves_ordinary_whitespace() {
+        let (single_space, _) = normalize_reasoning_boundaries("hello world", &[], true)
+            .expect("no boundaries required");
+        let (double_space, _) = normalize_reasoning_boundaries("hello  world", &[], true)
+            .expect("no boundaries required");
+        assert_ne!(single_space, double_space);
+    }
+
+    #[test]
+    fn reasoning_boundary_normalization_preserves_literal_tags() {
+        let text = "user: a </think> b\nassistant: thought \n</think>\n\nanswer";
+        let (normalized, _) =
+            normalize_reasoning_boundaries(text, &[1], true).expect("assistant boundary exists");
+
+        assert!(
+            normalized.starts_with("user: a </think> b\n"),
+            "the unselected literal user tag and its whitespace must remain exact"
+        );
+        assert!(normalized.ends_with("assistant: thought</think>answer"));
+    }
+
+    #[test]
+    fn cached_prefix_may_end_before_a_proven_reasoning_boundary() {
+        assert_eq!(
+            normalize_reasoning_boundaries("assistant: partial thought", &[0], false)
+                .map(|(text, _)| text),
+            Some("assistant: partial thought".to_string())
+        );
+        assert!(
+            normalize_reasoning_boundaries("assistant: partial thought", &[0], true).is_none(),
+            "a complete template render must contain every proven boundary"
+        );
+    }
+
+    #[test]
+    fn structured_reasoning_locator_rejects_unexplained_render_changes() {
+        let replacements = vec![(
+            "__SENTINEL__".to_string(),
+            "private".to_string(),
+            "answer".to_string(),
+        )];
+        assert_eq!(
+            locate_structured_reasoning_boundaries(
+                "user literal </think>\nassistant private\n</think>\nanswer",
+                "user literal </think>\nassistant __SENTINEL__\n</think>\nanswer",
+                &replacements,
+            ),
+            Some(vec![40])
+        );
+        assert_eq!(
+            locate_structured_reasoning_boundaries(
+                "user edited </think>\nassistant private\n</think>\nanswer",
+                "user literal </think>\nassistant __SENTINEL__\n</think>\nanswer",
+                &replacements,
+            ),
+            None,
+            "any difference outside the structured reasoning substitution fails closed"
+        );
+    }
+
+    #[test]
+    fn cached_reasoning_identity_rejects_message_owned_boundary_whitespace_edits() {
+        let cached = "assistant thought</think>\nanswer";
+        let exact = StructuredReasoningBoundary {
+            ordinal: 0,
+            reasoning: "thought".to_string(),
+            content: "answer continues beyond the cached prefix".to_string(),
+        };
+        assert!(cached_structured_reasoning_matches(cached, &[exact]));
+
+        let edited_reasoning = StructuredReasoningBoundary {
+            ordinal: 0,
+            reasoning: "thought ".to_string(),
+            content: "answer".to_string(),
+        };
+        assert!(!cached_structured_reasoning_matches(
+            cached,
+            &[edited_reasoning]
+        ));
+
+        let edited_content = StructuredReasoningBoundary {
+            ordinal: 0,
+            reasoning: "thought".to_string(),
+            content: " answer".to_string(),
+        };
+        assert!(!cached_structured_reasoning_matches(
+            cached,
+            &[edited_content]
+        ));
+    }
 }

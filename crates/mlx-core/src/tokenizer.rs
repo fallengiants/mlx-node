@@ -392,6 +392,33 @@ impl Qwen3Tokenizer {
         out
     }
 
+    /// Teach legacy Qwen3/Qwen3.5 templates to honor the replay-only
+    /// `preserve_thinking` context flag.
+    ///
+    /// Current Qwen templates gate historical reasoning with
+    /// `preserve_thinking or loop.index0 > ns.last_query_index`, but the
+    /// checkpoints used by the e2e matrix predate that flag and contain only
+    /// the second half of the condition. Re-rendering a completed transcript
+    /// through those templates therefore deletes the first assistant
+    /// reasoning span and guarantees a KV-prefix miss on turn two.
+    ///
+    /// The rewrite is deliberately narrow:
+    /// - templates already aware of `preserve_thinking` are byte-for-byte
+    ///   untouched;
+    /// - only the exact legacy Qwen history gate is extended;
+    /// - ordinary renders still behave exactly like upstream because the
+    ///   compatibility flag is supplied only by our chat-template context.
+    fn enable_legacy_preserve_thinking(template: &str) -> String {
+        const LEGACY_GATE: &str = "loop.index0 > ns.last_query_index";
+        if template.contains("preserve_thinking") || !template.contains(LEGACY_GATE) {
+            return template.to_string();
+        }
+        template.replace(
+            LEGACY_GATE,
+            "(preserve_thinking or loop.index0 > ns.last_query_index)",
+        )
+    }
+
     /// Advance past a two-byte close delimiter (`c0 c1`, e.g. `}}` or `#}`)
     /// starting the search at `from`. Returns the index just AFTER the close, or
     /// `bytes.len()` if the delimiter never appears (unterminated region — we
@@ -1228,7 +1255,8 @@ impl Qwen3Tokenizer {
         // block tags before parsing — minijinja doesn't implement them, and
         // they never alter the rendered output (LFM2.5 et al. use them only to
         // mark assistant-generated token spans for training masks).
-        let template_str = Self::neutralize_generation_tags(template_str);
+        let template_str = Self::enable_legacy_preserve_thinking(template_str);
+        let template_str = Self::neutralize_generation_tags(&template_str);
 
         env.add_template("chat", &template_str)
             .map_err(|e| format!("Template parse error: {}", e))?;
@@ -1323,6 +1351,9 @@ impl Qwen3Tokenizer {
             add_generation_prompt => add_generation_prompt,
             enable_thinking => enable_thinking.unwrap_or(true),
             preserve_thinking => true,
+            // LFM2.5-1.2B-Thinking predates the shared
+            // `preserve_thinking` name and uses this equivalent flag.
+            keep_past_thinking => true,
             bos_token => bos_token,
             eos_token => eos_token,
         };
@@ -1534,6 +1565,52 @@ impl Qwen3Tokenizer {
         content_order: MultimodalContentOrder,
         existing_image_placeholder: Option<&str>,
     ) -> Result<Vec<u32>> {
+        let formatted = self.render_chat_template_sync_with_content_order(
+            messages,
+            add_generation_prompt,
+            tools,
+            enable_thinking,
+            content_order,
+            existing_image_placeholder,
+        )?;
+
+        // Encode the formatted text (don't add extra special tokens)
+        let encoding = Self::encode_internal(&self.tokenizer, formatted, Some(false))?;
+        Ok(encoding.get_ids().to_vec())
+    }
+
+    /// Render the checkpoint chat template without tokenizing its output.
+    ///
+    /// Internal continuation verification uses this to locate structure that
+    /// came from typed message fields before an unknown-token fallback can
+    /// erase a provenance sentinel.
+    pub(crate) fn render_chat_template_sync(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: Option<bool>,
+        tools: Option<&[ToolDefinition]>,
+        enable_thinking: Option<bool>,
+    ) -> Result<String> {
+        self.render_chat_template_sync_with_content_order(
+            messages,
+            add_generation_prompt,
+            tools,
+            enable_thinking,
+            MultimodalContentOrder::TextThenMedia,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_chat_template_sync_with_content_order(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: Option<bool>,
+        tools: Option<&[ToolDefinition]>,
+        enable_thinking: Option<bool>,
+        content_order: MultimodalContentOrder,
+        existing_image_placeholder: Option<&str>,
+    ) -> Result<String> {
         let add_prompt = add_generation_prompt.unwrap_or(true);
 
         // Sanitize messages before formatting (prevents injection in all paths)
@@ -1551,7 +1628,7 @@ impl Qwen3Tokenizer {
             .chat_template
             .as_deref()
             .ok_or_else(|| Error::from_reason(MISSING_CHAT_TEMPLATE_ERROR))?;
-        let formatted = Self::render_chat_template_jinja2_with_content_order(
+        Self::render_chat_template_jinja2_with_content_order(
             chat_template,
             &sanitized,
             tools,
@@ -1562,11 +1639,7 @@ impl Qwen3Tokenizer {
             content_order,
             existing_image_placeholder,
         )
-        .map_err(Error::from_reason)?;
-
-        // Encode the formatted text (don't add extra special tokens)
-        let encoding = Self::encode_internal(&self.tokenizer, formatted, Some(false))?;
-        Ok(encoding.get_ids().to_vec())
+        .map_err(Error::from_reason)
     }
 }
 
@@ -2426,6 +2499,125 @@ mod tests {
         )
         .unwrap();
         assert_eq!(without_prompt, "ping");
+    }
+
+    #[test]
+    fn legacy_qwen_history_gate_honors_preserve_thinking() {
+        let template = r#"
+{%- set ns = namespace(last_query_index=messages|length - 1, found=false) -%}
+{%- for message in messages[::-1] -%}
+  {%- set index = (messages|length - 1) - loop.index0 -%}
+  {%- if not ns.found and message.role == "user" -%}
+    {%- set ns.last_query_index = index -%}
+    {%- set ns.found = true -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- for message in messages -%}
+  {%- if message.role == "assistant" -%}
+    {%- if loop.index0 > ns.last_query_index -%}
+      {{- "<think>" + message.reasoning_content + "</think>" + message.content -}}
+    {%- else -%}
+      {{- message.content -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+"#;
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "first".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                is_error: None,
+                reasoning_content: None,
+                thinking_enabled: None,
+                images: None,
+                audio: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "answer".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                is_error: None,
+                reasoning_content: Some("private chain".to_string()),
+                thinking_enabled: Some(true),
+                images: None,
+                audio: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "second".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                is_error: None,
+                reasoning_content: None,
+                thinking_enabled: None,
+                images: None,
+                audio: None,
+            },
+        ];
+
+        let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+            template, &messages, None, true, None, "<bos>", "<eos>",
+        )
+        .expect("legacy Qwen template should render");
+
+        assert_eq!(rendered, "<think>private chain</think>answer");
+    }
+
+    #[test]
+    fn modern_preserve_thinking_template_is_not_rewritten() {
+        let template =
+            "{% if preserve_thinking or loop.index0 > ns.last_query_index %}kept{% endif %}";
+        assert_eq!(
+            Qwen3Tokenizer::enable_legacy_preserve_thinking(template),
+            template,
+        );
+    }
+
+    #[test]
+    fn lfm_keep_past_thinking_alias_preserves_older_assistant_content() {
+        let template = r#"
+{%- set keep_past_thinking = keep_past_thinking | default(false) -%}
+{%- set ns = namespace(last_assistant_index=-1) -%}
+{%- for message in messages -%}
+  {%- if message.role == "assistant" -%}
+    {%- set ns.last_assistant_index = loop.index0 -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- for message in messages -%}
+  {%- if message.role == "assistant" -%}
+    {%- set content = message.content -%}
+    {%- if not keep_past_thinking and loop.index0 != ns.last_assistant_index -%}
+      {%- set content = content.split("</think>")[-1] | trim -%}
+    {%- endif -%}
+    {{- content -}}
+  {%- endif -%}
+{%- endfor -%}
+"#;
+        let assistant = |content: &str| ChatMessage {
+            role: "assistant".to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: Some(true),
+            images: None,
+            audio: None,
+        };
+        let messages = vec![
+            assistant("<think>first</think>one"),
+            assistant("<think>second</think>two"),
+        ];
+
+        let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+            template, &messages, None, true, None, "<bos>", "<eos>",
+        )
+        .expect("LFM compatibility template should render");
+
+        assert_eq!(rendered, "<think>first</think>one<think>second</think>two",);
     }
 
     /// Unit coverage of the scanner across every dash/whitespace variant and

@@ -879,6 +879,16 @@ const fn qwen35_dense_session_media(
     }
 }
 
+fn qwen35_dense_session_media_matches_payloads(
+    cached_image_key: Option<u64>,
+    images: &[Vec<u8>],
+    audio: &[Vec<u8>],
+) -> bool {
+    audio.is_empty()
+        && !images.is_empty()
+        && cached_image_key == Some(engine::compute_image_cache_key(images))
+}
+
 /// Make the resolved decoder authoritative for legacy Qwen3.5 whole-turn
 /// cores, which still derive their local `ChatParams` from a `ChatConfig`.
 fn apply_qwen35_dense_planned_decoder(config: &mut ChatConfig, decoder: DecoderPlan) -> bool {
@@ -9297,6 +9307,10 @@ pub(crate) struct DenseMtpStepper<'a> {
     /// Committed-history active iff the prompt tail's hiddens start at
     /// absolute position 0. == the closures' `use_committed`.
     use_committed: bool,
+    /// Chained verify-hidden reuse is only numerically stable when this turn
+    /// seeded the drafter with the full prompt. Warm suffix-only prefills have
+    /// no such seed and must retain Step A between cycles.
+    chained_cycles_supported: bool,
     /// Pre-verify snapshot of the main caches, taken in
     /// `snapshot_main_linear`, consumed by `rollback`. == the closures'
     /// `snap_cell`.
@@ -9358,6 +9372,10 @@ impl MtpStepper for DenseMtpStepper<'_> {
 
     fn committed_history_active(&self) -> bool {
         self.use_committed
+    }
+
+    fn chained_cycles_supported(&self) -> bool {
+        self.chained_cycles_supported
     }
 
     fn profiler_relabel(&self) -> Option<&'static str> {
@@ -9840,9 +9858,18 @@ impl MtpBackend for Qwen35Inner {
 
         // Committed-history is only correct when the prompt tail's hiddens
         // start at absolute position 0 (the eager drafter derives RoPE purely
-        // from the local cache offset). Continuation/delta turns
-        // (`position_base != 0`) fall back to v1 cycle-history.
-        let use_committed = setup.prompt_hidden_position_base == 0;
+        // from the local cache offset) AND the matching prompt seed is
+        // actually present. Cache-reuse continuations do not capture
+        // full-prompt hiddens; their default position base is still zero, so
+        // checking the base alone would falsely advertise an empty drafter
+        // cache as prompt-committed. Chained cycles would then skip the
+        // main-model anchor against that nonexistent history and could
+        // diverge from the full-reprefill heal. Seedless turns fall back to
+        // v1 cycle-history.
+        let has_prompt_seed = setup.prompt_hidden_position_base == 0
+            && setup.prompt_hidden.is_some()
+            && setup.prompt_hidden_ids.is_some_and(|ids| !ids.is_empty());
+        let use_committed = has_prompt_seed;
 
         // Auto-select the main-forward routing: the paged cores leave a paged
         // adapter on `self`, so `take()` moves it into the stepper for the turn
@@ -9864,6 +9891,7 @@ impl MtpBackend for Qwen35Inner {
             mtp_caches: Qwen3_5MTPModule::fresh_caches(&config),
             committed_len: 0,
             use_committed,
+            chained_cycles_supported: has_prompt_seed,
             snap: None,
             tape: Vec::new(),
             replay_err: None,
@@ -10263,6 +10291,21 @@ impl ChatBackend for Qwen35Inner {
         qwen35_dense_session_media(
             self.cached_image_key.is_some(),
             self.cached_rope_deltas.is_some(),
+        )
+    }
+
+    fn session_media_matches_payloads(&self, images: &[Vec<u8>], audio: &[Vec<u8>]) -> bool {
+        qwen35_dense_session_media_matches_payloads(self.cached_image_key, images, audio)
+    }
+
+    fn template_history_comparison_tokens<'a>(
+        &self,
+        tokens: &'a [u32],
+    ) -> std::borrow::Cow<'a, [u32]> {
+        engine::collapse_cached_media_placeholder_runs(
+            tokens,
+            IMAGE_TOKEN_ID as u32,
+            &self.cached_paged_image_token_positions,
         )
     }
 
@@ -14042,6 +14085,33 @@ mod paged_construction_tests {
             qwen35_dense_session_media(false, false),
             MediaCapabilities::NONE
         );
+    }
+
+    #[test]
+    fn test_qwen35_session_media_payload_identity() {
+        let images = vec![vec![1, 2, 3]];
+        let cached_key = Some(engine::compute_image_cache_key(&images));
+
+        assert!(qwen35_dense_session_media_matches_payloads(
+            cached_key,
+            &images,
+            &[]
+        ));
+        assert!(!qwen35_dense_session_media_matches_payloads(
+            cached_key,
+            &[vec![1, 2, 4]],
+            &[]
+        ));
+        assert!(!qwen35_dense_session_media_matches_payloads(
+            cached_key,
+            &images,
+            &[vec![9]]
+        ));
+        assert!(!qwen35_dense_session_media_matches_payloads(
+            None,
+            &images,
+            &[]
+        ));
     }
 
     #[test]

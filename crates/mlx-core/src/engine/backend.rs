@@ -11,6 +11,7 @@
 //! expose `.call(napi::Result<ChatStreamChunk>, ThreadsafeFunctionCallMode)`,
 //! and the trait collapses that to a single `send`.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -1085,6 +1086,29 @@ pub(crate) trait ChatBackend {
         MediaCapabilities::NONE
     }
 
+    /// Whether the supplied historical media payloads are the exact media
+    /// represented by the live session cache.
+    ///
+    /// The session core calls this only after the non-empty media kinds match
+    /// [`Self::session_media`]. Backends must opt in by comparing a cached
+    /// payload key or digest; the fail-closed default forces a cold replay
+    /// whenever identity cannot be proven.
+    fn session_media_matches_payloads(&self, _images: &[Vec<u8>], _audio: &[Vec<u8>]) -> bool {
+        false
+    }
+
+    /// Convert a live cached-history token stream to the logical form emitted
+    /// by the checkpoint chat template for comparison only.
+    ///
+    /// VLM backends expand one logical image marker into many placeholder
+    /// tokens before prefill. Their live history therefore needs to collapse
+    /// those recorded media positions before it can be compared with a fresh
+    /// template render. The returned tokens never replace the real cache
+    /// history; they are used only by the continuation verifier.
+    fn template_history_comparison_tokens<'a>(&self, tokens: &'a [u32]) -> Cow<'a, [u32]> {
+        Cow::Borrowed(tokens)
+    }
+
     // ---- specialized whole-turn executors ----
     //
     // The session calls exactly one executor selected by `TurnPlan::path`.
@@ -1498,6 +1522,16 @@ pub(crate) trait MtpStepper {
     /// steppers with no committed-history support return `false`.
     /// == `MtpOps::committed_history_active`.
     fn committed_history_active(&self) -> bool;
+
+    /// Whether this turn may reuse the previous verify hidden to skip the
+    /// next main-model Step A forward.
+    ///
+    /// Most steppers can use the global chained-cycle policy directly.
+    /// Families whose chained path depends on a turn-local prompt seed can
+    /// return `false` when that seed is unavailable.
+    fn chained_cycles_supported(&self) -> bool {
+        true
+    }
 
     /// Optional profiler relabel for the MTP path (e.g.
     /// `"chat_compiled"`); `None` keeps the default family label. Read
