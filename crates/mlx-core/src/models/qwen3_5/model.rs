@@ -732,6 +732,11 @@ fn clone_dense_linear_layer_caches(
 /// and training state. Training commands are routed via `TrainingDispatch`.
 pub(crate) struct Qwen35Inner {
     pub(crate) config: Qwen3_5Config,
+    /// Turn-constant layer classification (`Linear` vs `FullAttentionPaged`),
+    /// computed once in [`Self::new`] instead of re-derived on every paged
+    /// decode step. Pure function of the immutable `config`. Mirrors the
+    /// `Gemma4Inner::layer_kinds` caching pattern.
+    pub(crate) layer_kinds: Vec<super::decoder_layer::Qwen3_5LayerKind>,
     pub(crate) embedding: Embedding,
     pub(crate) layers: Vec<DecoderLayer>,
     pub(crate) final_norm: RMSNorm,
@@ -1212,6 +1217,13 @@ impl Qwen35Inner {
 
         let model_id = QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
+        // Layer classification is a pure function of the immutable config;
+        // compute once here (see the field rustdoc).
+        let layer_kinds =
+            super::decoder_layer::compute_layer_kinds(config.num_layers as usize, |i| {
+                config.is_linear_layer(i)
+            });
+
         // The physical paged pool is intentionally created only after weight
         // loading/materialization. At this point the MLX allocator does not yet
         // know the resident model footprint, so sizing here can overcommit
@@ -1231,6 +1243,7 @@ impl Qwen35Inner {
 
         Ok(Self {
             config,
+            layer_kinds,
             embedding,
             layers,
             final_norm,
@@ -8525,10 +8538,6 @@ impl DecodeStep for Qwen35PagedDecode<'_> {
         // signature parity).
         let logits = {
             let embed = self.inner.embedding.clone();
-            let layer_kinds = super::decoder_layer::compute_layer_kinds(
-                self.inner.config.num_layers as usize,
-                |i| self.inner.config.is_linear_layer(i),
-            );
             let caches_ref = self.inner.caches.as_mut().ok_or_else(|| {
                 Error::from_reason("Qwen35PagedDecode::forward: caches dropped mid-decode")
             })?;
@@ -8542,7 +8551,7 @@ impl DecodeStep for Qwen35PagedDecode<'_> {
                 caches_ref,
                 &self.inner.final_norm,
                 &self.inner.lm_head,
-                &layer_kinds,
+                &self.inner.layer_kinds,
                 adapter,
                 self.inner.cached_rope_deltas.unwrap_or(0),
             )?
@@ -9803,10 +9812,9 @@ impl MtpBackend for Qwen35Inner {
         // paged forwards need the per-layer kind classification (unused flat).
         let (mode, layer_kinds) = match self.paged_adapter.take() {
             Some(adapter) => {
-                let layer_kinds = super::decoder_layer::compute_layer_kinds(
-                    self.config.num_layers as usize,
-                    |i| self.config.is_linear_layer(i),
-                );
+                // Cached once at construction (see the field rustdoc); clone is
+                // a copy of the turn-constant classification.
+                let layer_kinds = self.layer_kinds.clone();
                 (MtpStepMode::Paged(Box::new(adapter)), layer_kinds)
             }
             None => (MtpStepMode::Flat, Vec::new()),
@@ -15074,5 +15082,63 @@ mod paged_construction_tests {
         let _ = adapter.register_full_blocks_for_reuse(&[], 0);
         adapter.release_request().expect("release_request");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod layer_kinds_cache_tests {
+    //! The paged decode steppers consume `Qwen35Inner::layer_kinds` (cached
+    //! at construction) instead of re-deriving it per step. Pin the
+    //! invariant: the cached classification must equal a fresh from-scratch
+    //! computation over the same config (mirrors the gemma4
+    //! `test_gemma4_inner_caches_layer_kinds_matching_fresh_compute` test).
+    //! Construction-only: `Qwen35Inner::new` defers the Metal paged pool to
+    //! `initialize_paged_adapter`, so this needs no GPU.
+
+    use super::*;
+    use crate::models::qwen3_5::config::Qwen3_5Config;
+    use crate::models::qwen3_5::decoder_layer::compute_layer_kinds;
+
+    fn tiny_cfg() -> Qwen3_5Config {
+        Qwen3_5Config {
+            vocab_size: 1024,
+            hidden_size: 64,
+            num_layers: 8,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 1024,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 100_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: None,
+            persist_paged_cache: None,
+            n_mtp_layers: 0,
+        }
+    }
+
+    #[test]
+    fn inner_caches_layer_kinds_matching_fresh_compute() {
+        let cfg = tiny_cfg();
+        let inner = Qwen35Inner::new(cfg.clone()).expect("construct");
+        let fresh = compute_layer_kinds(cfg.num_layers as usize, |i| cfg.is_linear_layer(i));
+        assert_eq!(
+            inner.layer_kinds, fresh,
+            "cached layer classification must equal a fresh compute over the same config"
+        );
     }
 }
