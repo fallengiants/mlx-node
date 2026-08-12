@@ -207,6 +207,10 @@ fn load_prompts(model_dir: &Path) -> HashMap<String, String> {
 }
 
 /// Map HuggingFace parameter names to internal names.
+///
+/// Handles two naming conventions:
+/// - Standard HF format: `model.embed_tokens.weight`, `model.norm.weight`
+/// - Bare format (some embedding models): `embed_tokens.weight`, `norm.weight`
 fn map_hf_names(params: &mut HashMap<String, MxArray>) -> HashMap<String, MxArray> {
     let mut mapped = HashMap::new();
 
@@ -224,6 +228,15 @@ fn map_hf_names(params: &mut HashMap<String, MxArray>) -> HashMap<String, MxArra
         } else if name == "lm_head.weight" {
             // Skip lm_head if present — embedding model doesn't use it
             continue;
+        } else if name == "embed_tokens.weight" {
+            // Bare format (no model. prefix) — Qwen3-Embedding convention
+            "embedding.weight".to_string()
+        } else if name.starts_with("embed_tokens.") {
+            // Bare format for other embed_tokens keys
+            name.replace("embed_tokens", "embedding")
+        } else if name == "norm.weight" {
+            // Bare format — final norm
+            "final_norm.weight".to_string()
         } else {
             name
         };
